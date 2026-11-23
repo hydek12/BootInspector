@@ -241,6 +241,13 @@ struct ContentView: View {
     @State private var hashes: [Int: String] = [:]
     @State private var verifying = false
     @State private var inspecting = false
+    @State private var biosMatches: [PlayStationTools.BIOS]?
+    @State private var alundraProfile = false
+    @State private var cueRepair: PlayStationTools.CueRepair?
+    @State private var batch: [PlayStationTools.BatchRecord]?
+    @State private var sectorSummary: CDSectorIntegrity.Summary?
+    @State private var toolBusy = false
+    @State private var toolError: String?
     @State private var isTargeted = false
 
     private let playStationExtensions: Set<String> = [
@@ -260,6 +267,10 @@ struct ContentView: View {
                         .foregroundColor(.secondary)
                 }
                 Spacer()
+                if playStationMode {
+                    Button(toolBusy ? "Working…" : "Scan Library…") { scanLibrary() }
+                        .disabled(toolBusy)
+                }
                 Button("Open Image...") {
                     pickFile()
                 }
@@ -286,6 +297,9 @@ struct ContentView: View {
                 dropZoneView
             }
 
+            if let toolError {
+                Text(toolError).font(.caption).foregroundStyle(.red)
+            }
             if let errorMessage = errorMessage {
                 Text(errorMessage)
                     .font(.caption)
@@ -294,6 +308,12 @@ struct ContentView: View {
         }
         .padding(20)
         .frame(minWidth: 680, minHeight: 500)
+        .sheet(isPresented: Binding(get: { cueRepair != nil }, set: { if !$0 { cueRepair = nil } })) {
+            if let cueRepair { cueRepairSheet(cueRepair) }
+        }
+        .sheet(isPresented: Binding(get: { batch != nil }, set: { if !$0 { batch = nil } })) {
+            if let batch { batchSheet(batch) }
+        }
         .onDrop(of: [.fileURL], isTargeted: $isTargeted) { providers in
             handleDrop(providers: providers)
         }
@@ -471,9 +491,12 @@ struct ContentView: View {
     private func analyze(url: URL) {
         inspection?.cancel()
         errorMessage = nil
+        toolError = nil
+        alundraProfile = false
         psReport = nil
         report = nil
         hashes = [:]
+        sectorSummary = nil
         verifying = false
         if playStationMode {
             inspecting = true
@@ -572,6 +595,172 @@ struct ContentView: View {
         }
     }
 
+    private func verifySectors(_ report: PlayStationReport) {
+        let folder = trackFolder
+        toolBusy = true
+        toolError = nil
+        sectorSummary = nil
+        Task {
+            defer { toolBusy = false }
+            do {
+                let summary = try await Task.detached(priority: .utility) {
+                    let folderScope = folder?.startAccessingSecurityScopedResource() ?? false
+                    let imageScope = report.file.startAccessingSecurityScopedResource()
+                    defer {
+                        if folderScope { folder?.stopAccessingSecurityScopedResource() }
+                        if imageScope { report.file.stopAccessingSecurityScopedResource() }
+                    }
+                    return try CDSectorIntegrity.scan(report.tracks)
+                }.value
+                if psReport?.file == report.file { sectorSummary = summary }
+            } catch { toolError = error.localizedDescription }
+        }
+    }
+
+    private func selectFolder(_ prompt: String, at directory: URL? = nil) -> URL? {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.directoryURL = directory
+        panel.prompt = prompt
+        return panel.runModal() == .OK ? panel.url : nil
+    }
+
+    private func scanBIOS() {
+        guard let folder = selectFolder("Scan BIOS Folder") else { return }
+        toolBusy = true
+        toolError = nil
+        Task {
+            defer { toolBusy = false }
+            do {
+                biosMatches = try await Task.detached(priority: .utility) {
+                    try PlayStationTools.scanBIOS(in: folder)
+                }.value
+            } catch { toolError = error.localizedDescription }
+        }
+    }
+
+    private func scanLibrary() {
+        guard let folder = selectFolder("Scan Disc Library") else { return }
+        toolBusy = true
+        toolError = nil
+        Task {
+            defer { toolBusy = false }
+            do {
+                batch = try await Task.detached(priority: .utility) {
+                    try PlayStationTools.scanLibrary(folder)
+                }.value
+            } catch { toolError = error.localizedDescription }
+        }
+    }
+
+    private func previewRepair(for report: PlayStationReport) {
+        let panel = NSOpenPanel()
+        panel.directoryURL = report.file.deletingLastPathComponent()
+        panel.prompt = "Preview Replacement"
+        guard panel.runModal() == .OK, let replacement = panel.url else { return }
+        toolBusy = true
+        toolError = nil
+        let folder = trackFolder
+        Task {
+            defer { toolBusy = false }
+            do {
+                cueRepair = try await Task.detached(priority: .userInitiated) {
+                    try PlayStationTools.previewCueRepair(report.file, with: replacement, folder: folder)
+                }.value
+            } catch { toolError = error.localizedDescription }
+        }
+    }
+
+    private func cueRepairSheet(_ repair: PlayStationTools.CueRepair) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Preview CUE Repair").font(.headline)
+            infoRow("Missing file", repair.originalName)
+            infoRow("Replacement", repair.replacementName)
+            if let serial = repair.serial { infoRow("Replacement serial", serial) }
+            Text("Save a repaired copy beside its BIN files. The original CUE stays in place.")
+                .font(.subheadline).foregroundStyle(.secondary)
+            HStack {
+                Spacer()
+                Button("Cancel") { cueRepair = nil }
+                Button("Save Repaired Copy…") {
+                    let directory = repair.source.deletingPathExtension().deletingLastPathComponent().standardizedFileURL
+                    let defaultName = repair.source.deletingPathExtension().lastPathComponent + " (repaired).cue"
+                    if let destination = exportDestination(defaultName, directory: directory) {
+                        guard destination.deletingLastPathComponent().standardizedFileURL == directory,
+                              destination.pathExtension.lowercased() == "cue",
+                              !FileManager.default.fileExists(atPath: destination.path) else {
+                            toolError = "Choose a new .cue filename in the original disc folder."
+                            cueRepair = nil
+                            return
+                        }
+                        do {
+                            try repair.data.write(to: destination, options: .withoutOverwriting)
+                            cueRepair = nil
+                            currentURL = destination
+                            analyze(url: destination)
+                        } catch {
+                            toolError = error.localizedDescription
+                            cueRepair = nil
+                        }
+                    }
+                }
+            }
+        }
+        .padding(20).frame(minWidth: 470)
+        .textSelection(.enabled)
+    }
+
+    private func exportDestination(_ filename: String, directory: URL? = nil) -> URL? {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = filename
+        panel.directoryURL = directory
+        return panel.runModal() == .OK ? panel.url : nil
+    }
+
+    private func batchSheet(_ batch: [PlayStationTools.BatchRecord]) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("PlayStation Library Scan").font(.headline)
+            Text("\(batch.count) entries · \(batch.filter(\.bootVerified).count) verified boot entries")
+                .font(.subheadline)
+            List(batch, id: \.path) { entry in
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(entry.path).lineLimit(1)
+                    Text([entry.serial ?? entry.format, entry.region, "\(entry.tracks) tracks"].joined(separator: " · "))
+                        .font(.caption).foregroundStyle(.secondary)
+                    ForEach(Array(entry.notes.enumerated()), id: \.offset) { note in
+                        Text(note.element).font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            }
+            HStack {
+                Spacer()
+                Button("Close") { self.batch = nil }
+                Button("Export CSV…") {
+                    guard let url = exportDestination("PlayStation Library.csv") else { return }
+                    do {
+                        try PlayStationTools.batchCSV(batch).write(to: url, atomically: true, encoding: .utf8)
+                    } catch {
+                        toolError = error.localizedDescription
+                        self.batch = nil
+                    }
+                }
+                Button("Export JSON…") {
+                    guard let url = exportDestination("PlayStation Library.json") else { return }
+                    do {
+                        let encoder = JSONEncoder()
+                        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+                        try encoder.encode(batch).write(to: url, options: .atomic)
+                    } catch {
+                        toolError = error.localizedDescription
+                        self.batch = nil
+                    }
+                }
+            }
+        }
+        .padding(20).frame(minWidth: 620, minHeight: 440)
+    }
+
     private func playStationReportView(_ report: PlayStationReport) -> some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
@@ -591,6 +780,25 @@ struct ContentView: View {
                             infoRow(key, report.regions[key] ?? "")
                         }
                         infoRow("Region-matched BIOS", report.bios)
+                        if report.serial == "SLES-01135" {
+                            Toggle("Use Alundra Recompiled firmware profile", isOn: $alundraProfile)
+                            if alundraProfile {
+                                infoRow("Required firmware", "SCPH-5552 · exact SHA-256 match")
+                            }
+                        }
+                        Button("Scan BIOS Folder…") { scanBIOS() }.disabled(toolBusy)
+                        if let biosMatches {
+                            let matches = alundraProfile
+                                ? biosMatches.filter { $0.sha256 == PlayStationTools.alundraBIOS }
+                                : biosMatches.filter { $0.region == report.region }
+                            if matches.isEmpty {
+                                Text("No matching known BIOS in the selected folder.").font(.caption)
+                            } else {
+                                ForEach(matches) { match in
+                                    infoRow(match.model, match.file.lastPathComponent)
+                                }
+                            }
+                        }
                         infoRow("ISO 9660 volume", report.volume ?? "Unavailable")
                         infoRow("Boot path", report.bootPath ?? "Unavailable")
                         infoRow("SBI companion", report.hasSBI ? "Present" : "Not found or inaccessible")
@@ -630,13 +838,29 @@ struct ContentView: View {
                             if report.canUseCHDTool {
                                 Button("Inspect With chdman…") { inspectUsingCHDTool(report) }
                             }
+                            if report.format == "CUE", report.warnings.contains(where: { $0.hasPrefix("Missing or unreadable track file:") }) {
+                                Button("Preview CUE Repair…") { previewRepair(for: report) }.disabled(toolBusy)
+                            }
                             if ["CUE", "CCD", "TOC", "GDI"].contains(report.format) {
                                 Button("Grant Track Folder Access…") { grantTrackFolder(for: report.file) }
                             }
-                            if !["CHD", "TOC", "NRG", "GDI"].contains(report.format),
+                            if !["CHD", "TOC", "NRG", "GDI", "ECM"].contains(report.format),
                                report.tracks.contains(where: { $0.frames != nil }) {
                                 Button(verifying ? "Hashing…" : "Calculate Track SHA-1") { verifyTracks(report) }
                                     .disabled(verifying)
+                            }
+                            if report.tracks.contains(where: CDSectorIntegrity.supports) {
+                                Button(toolBusy ? "Working…" : "Verify Raw Sector EDC/ECC") { verifySectors(report) }
+                                    .disabled(toolBusy)
+                            }
+                            if let sectorSummary {
+                                infoRow("Raw sectors checked", sectorSummary.sectors.formatted())
+                                infoRow("EDC mismatches", "\(sectorSummary.edcMismatches) / \(sectorSummary.checkedEDC)")
+                                infoRow("ECC mismatches", "\(sectorSummary.eccMismatches) / \(sectorSummary.checkedECC)")
+                                infoRow("Malformed headers", sectorSummary.malformedHeaders.formatted())
+                                infoRow("Form 2 without EDC", sectorSummary.omittedForm2EDC.formatted())
+                                infoRow("Other unchecked sector modes", sectorSummary.uncheckedSectors.formatted())
+                                ForEach(sectorSummary.examples, id: \.self) { Text($0) }
                             }
                         }
                         .font(.caption)

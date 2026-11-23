@@ -88,7 +88,9 @@ nonisolated enum PlayStationInspector {
         case "toc", "nrg", "gdi":
             report.warnings.append("Use chdman to convert this descriptor temporarily and inspect the resulting CD tracks.")
             return report
-        case "ecm", "pbp", "cso", "zso", "isz", "dax", "mds":
+        case "ecm":
+            return try inspectECM(url, container: report)
+        case "pbp", "cso", "zso", "isz", "dax", "mds":
             let guidance = kind == "mds" ? "Open the companion MDF to inspect its data track, or convert MDS/MDF to CUE/BIN to preserve the track layout." :
                 "Decode or convert the image to CUE/BIN or CHD before inspection."
             throw InspectionError("\(kind.uppercased()) container. \(guidance)")
@@ -123,6 +125,31 @@ nonisolated enum PlayStationInspector {
         if report.volume == nil { report.warnings.append("No readable ISO 9660 data track was found.") }
         if report.bootPath == nil { report.warnings.append("No PlayStation boot entry was found.") }
         if report.region == "Conflicting evidence" { report.warnings.append("The boot serial and license area indicate different regions.") }
+        return report
+    }
+
+    private static func inspectECM(_ url: URL, container: PlayStationReport) throws -> PlayStationReport {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let image = directory.appendingPathComponent("decoded.bin")
+        try PlayStationECM.decode(url, to: image)
+        let decoded = try inspect(image)
+        var report = container
+        report.size = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+        report.volume = decoded.volume
+        report.serial = decoded.serial
+        report.bootPath = decoded.bootPath
+        report.bootValid = decoded.bootValid
+        report.bootDetails = decoded.bootDetails
+        report.config = decoded.config
+        report.regions = decoded.regions
+        report.tracks = decoded.tracks.map {
+            PlayStationTrack(id: $0.id, type: $0.type, file: url, sectorBytes: $0.sectorBytes,
+                             start: $0.start, frames: $0.frames)
+        }
+        report.warnings = decoded.warnings
+        report.warnings.append("ECM checksum verified. Track sizes are from the decoded data.")
         return report
     }
 
