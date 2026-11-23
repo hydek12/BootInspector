@@ -249,7 +249,9 @@ struct ContentView: View {
     @State private var biosMatches: [PlayStationTools.BIOS]?
     @State private var alundraProfile = false
     @State private var cueRepair: PlayStationTools.CueRepair?
-    @State private var batch: [PlayStationTools.BatchRecord]?
+    @State private var batch: [PlayStationTools.ScanEntry]?
+    @State private var showingBatch = false
+    @State private var scanTask: Task<Void, Never>?
     @State private var gameDB: PlayStationCatalog?
     @State private var discDAT: PlayStationCatalog?
     @State private var sectorSummary: CDSectorIntegrity.Summary?
@@ -296,10 +298,27 @@ struct ContentView: View {
             }
             .pickerStyle(.segmented)
             .onChange(of: playStationMode) {
-                if let currentURL { analyze(url: currentURL) }
+                if !showingBatch, let currentURL { analyze(url: currentURL) }
             }
 
-            if inspecting {
+            if let batch, !showingBatch {
+                Button("Back to Scan Results", systemImage: "chevron.left") {
+                    inspection?.cancel()
+                    inspecting = false
+                    showingBatch = true
+                    errorMessage = nil
+                    toolError = nil
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .disabled(batch.isEmpty)
+            }
+
+            if scanTask != nil {
+                ProgressView("Scanning disc images…")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if showingBatch, let batch {
+                batchResults(batch)
+            } else if inspecting {
                 ProgressView("Reading disc image…")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if playStationMode, let psReport {
@@ -323,9 +342,6 @@ struct ContentView: View {
         .frame(minWidth: 680, minHeight: 500)
         .sheet(isPresented: Binding(get: { cueRepair != nil }, set: { if !$0 { cueRepair = nil } })) {
             if let cueRepair { cueRepairSheet(cueRepair) }
-        }
-        .sheet(isPresented: Binding(get: { batch != nil }, set: { if !$0 { batch = nil } })) {
-            if let batch { batchSheet(batch) }
         }
         .onDrop(of: [.fileURL], isTargeted: $isTargeted) { providers in
             handleDrop(providers: providers)
@@ -503,15 +519,27 @@ struct ContentView: View {
         return true
     }
 
-    private func open(url: URL) {
+    private func open(url: URL, from entry: PlayStationTools.ScanEntry? = nil) {
         inspection?.cancel()
+        if entry == nil {
+            scanTask?.cancel()
+            if scanTask != nil { toolBusy = false }
+            scanTask = nil
+            batch = nil
+        }
+        showingBatch = false
         inspecting = true
         errorMessage = nil
         toolError = nil
-        trackFolder = nil
+        let folder = entry?.accessFolder
+        trackFolder = folder
         inspection = Task {
             do {
-                let type = try await Task.detached(priority: .userInitiated) { try DiscImageType.detect(url) }.value
+                let type = try await Task.detached(priority: .userInitiated) {
+                    let scoped = folder?.startAccessingSecurityScopedResource() ?? false
+                    defer { if scoped { folder?.stopAccessingSecurityScopedResource() } }
+                    return try DiscImageType.detect(url)
+                }.value
                 guard !Task.isCancelled else { return }
                 if type == .folder {
                     inspecting = false
@@ -571,6 +599,9 @@ struct ContentView: View {
         } else {
             inspecting = false
             do {
+                let folder = trackFolder
+                let scoped = folder?.startAccessingSecurityScopedResource() ?? false
+                defer { if scoped { folder?.stopAccessingSecurityScopedResource() } }
                 report = try DiskImageInspector.inspect(url: url)
             } catch {
                 errorMessage = "Failed to inspect image: \(error.localizedDescription)"
@@ -714,21 +745,35 @@ struct ContentView: View {
     }
 
     private func scanSelection(_ urls: [URL]) {
-        guard !toolBusy else {
+        guard !toolBusy || scanTask != nil else {
             toolError = "Wait for the current library tool to finish."
             return
         }
+        scanTask?.cancel()
+        inspection?.cancel()
+        inspecting = false
+        errorMessage = nil
+        toolError = nil
         let gameDB = gameDB
         let dat = discDAT
         toolBusy = true
-        toolError = nil
-        Task {
-            defer { toolBusy = false }
-            do {
-                batch = try await Task.detached(priority: .utility) {
-                    try PlayStationTools.scanSelection(urls, gameDB: gameDB, dat: dat)
-                }.value
-            } catch { toolError = error.localizedDescription }
+        scanTask = Task {
+            let worker = Task.detached(priority: .utility) {
+                try PlayStationTools.scanEntries(urls, gameDB: gameDB, dat: dat)
+            }
+            let result = await withTaskCancellationHandler {
+                await worker.result
+            } onCancel: { worker.cancel() }
+            guard !Task.isCancelled else { return }
+            scanTask = nil
+            toolBusy = false
+            switch result {
+            case .success(let entries):
+                batch = entries
+                showingBatch = true
+            case .failure(let error):
+                toolError = error.localizedDescription
+            }
         }
     }
 
@@ -795,14 +840,19 @@ struct ContentView: View {
         return panel.runModal() == .OK ? panel.url : nil
     }
 
-    private func batchSheet(_ batch: [PlayStationTools.BatchRecord]) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
+    private func batchResults(_ entries: [PlayStationTools.ScanEntry]) -> some View {
+        let batch = entries.map(\.record)
+        return VStack(alignment: .leading, spacing: 12) {
             Text("Disc Image Scan").font(.headline)
             Text("\(batch.count) entries · \(batch.filter(\.bootVerified).count) verified boot entries")
                 .font(.subheadline)
-            List(batch, id: \.path) { entry in
+            List(entries) { item in
+                let entry = item.record
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(entry.path).lineLimit(1)
+                    Button { open(url: item.file, from: item) } label: {
+                        Label(entry.path, systemImage: "opticaldisc").lineLimit(1)
+                    }
+                    .buttonStyle(.link)
                     Text(([entry.format, entry.serial, entry.region].compactMap { $0 } +
                           (entry.tracks > 0 ? ["\(entry.tracks) tracks"] : [])).joined(separator: " · "))
                         .font(.caption).foregroundStyle(.secondary)
@@ -817,14 +867,19 @@ struct ContentView: View {
             }
             HStack {
                 Spacer()
-                Button("Close") { self.batch = nil }
+                Button("Clear Results") {
+                    self.batch = nil
+                    showingBatch = false
+                    currentURL = nil
+                    report = nil
+                    psReport = nil
+                }
                 Button("Export CSV…") {
                     guard let url = exportDestination("Disc Image Scan.csv") else { return }
                     do {
                         try PlayStationTools.batchCSV(batch).write(to: url, atomically: true, encoding: .utf8)
                     } catch {
                         toolError = error.localizedDescription
-                        self.batch = nil
                     }
                 }
                 Button("Export JSON…") {
@@ -835,12 +890,11 @@ struct ContentView: View {
                         try encoder.encode(batch).write(to: url, options: .atomic)
                     } catch {
                         toolError = error.localizedDescription
-                        self.batch = nil
                     }
                 }
             }
         }
-        .padding(20).frame(minWidth: 620, minHeight: 440)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
     private func playStationReportView(_ report: PlayStationReport) -> some View {

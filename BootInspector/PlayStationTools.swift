@@ -33,6 +33,14 @@ nonisolated enum PlayStationTools {
         var sbi: String? = nil
     }
 
+    struct ScanEntry: Identifiable, Sendable {
+        let record: BatchRecord
+        let file: URL
+        let accessFolder: URL?
+
+        var id: URL { file.standardizedFileURL }
+    }
+
     static func batchCSV(_ records: [BatchRecord]) -> String {
         let header = "path,format,serial,region,boot_verified,tracks,notes,catalog_title,catalog_match,libcrypt,sbi"
         let rows = records.map { record in
@@ -201,6 +209,11 @@ nonisolated enum PlayStationTools {
 
     static func scanSelection(_ selection: [URL], gameDB: PlayStationCatalog? = nil,
                               dat: PlayStationCatalog? = nil) throws -> [BatchRecord] {
+        try scanEntries(selection, gameDB: gameDB, dat: dat).map(\.record)
+    }
+
+    static func scanEntries(_ selection: [URL], gameDB: PlayStationCatalog? = nil,
+                            dat: PlayStationCatalog? = nil) throws -> [ScanEntry] {
         let accessed = selection.filter { $0.startAccessingSecurityScopedResource() }
         defer { accessed.forEach { $0.stopAccessingSecurityScopedResource() } }
         let extensions: Set<String> = ["iso", "chd", "ecm", "img", "bin", "mdf", "raw", "2352", "2448",
@@ -210,13 +223,15 @@ nonisolated enum PlayStationTools {
         var loose: [URL] = []
         var companions: [String: PlayStationInspector.Companions] = [:]
         var seen = Set<String>()
+        var foldersByPath: [String: URL] = [:]
         var explicit = Set<String>()
         var relativeRoot: URL?
 
-        func add(_ file: URL, explicitlySelected: Bool) throws {
+        func add(_ file: URL, explicitlySelected: Bool, accessFolder: URL? = nil) throws {
             try Task.checkCancellation()
             let path = file.standardizedFileURL.path
             if explicitlySelected { explicit.insert(path) }
+            if let accessFolder { foldersByPath[path] = accessFolder }
             guard seen.insert(path).inserted else { return }
             let ext = file.pathExtension.lowercased()
             if ext == "sbi" || ext == "sub" {
@@ -247,7 +262,7 @@ nonisolated enum PlayStationTools {
                 guard suffix.isEmpty || extensions.contains(suffix) || DiscImageType.descriptors.contains(suffix) ||
                     suffix == "sbi" || suffix == "sub" else { continue }
                 if (try? file.resourceValues(forKeys: keys).isRegularFile) == true {
-                    try add(file, explicitlySelected: false)
+                    try add(file, explicitlySelected: false, accessFolder: item)
                 }
             }
         }
@@ -310,8 +325,14 @@ nonisolated enum PlayStationTools {
                     bootVerified: false, tracks: 0, notes: [error.localizedDescription])
             }
         }
-        let descriptorReports = try descriptors.compactMap(inspect)
-        let rawReports = try loose.filter { !backing.contains($0.standardizedFileURL) }.compactMap(inspect)
-        return (descriptorReports + rawReports).sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
+        func entry(_ file: URL) throws -> ScanEntry? {
+            guard let record = try inspect(file) else { return nil }
+            return ScanEntry(record: record, file: file, accessFolder: foldersByPath[file.standardizedFileURL.path])
+        }
+        let descriptorReports = try descriptors.compactMap(entry)
+        let rawReports = try loose.filter { !backing.contains($0.standardizedFileURL) }.compactMap(entry)
+        return (descriptorReports + rawReports).sorted {
+            $0.record.path.localizedStandardCompare($1.record.path) == .orderedAscending
+        }
     }
 }

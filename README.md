@@ -8,7 +8,7 @@ Open `BootInspector.xcodeproj` in Xcode 27.2 and build the BootInspector scheme.
 
 ## PlayStation disc inspection
 
-Drop an image to select its inspection mode automatically. BootInspector checks signatures and filesystem data to distinguish Mac OS, generic ISO 9660, and PlayStation images, including cooked and raw layouts. Drop several files or a folder to scan the selection recursively with the detected formats shown per disc.
+Drop an image to select its inspection mode automatically. BootInspector checks signatures and filesystem data to distinguish Mac OS, generic ISO 9660, and PlayStation images, including cooked and raw layouts. Drop several files or a folder to scan the selection recursively with the detected formats shown per disc in the main window. Select a result to inspect it in the same window, then use **Back to Scan Results** to return.
 
 | Input | Inspection |
 |---|---|

@@ -46,4 +46,20 @@ struct DiscImageTypeTests {
         #expect(selectionRows.count == 3)
         #expect(Set(selectionRows.map(\.format)) == ["ISO 9660", "Mac OS", "CUE"])
     }
+    @Test func scanEntriesRetainTheSourceAndFolderGrant() throws {
+        let fixture = try DiscFixture()
+        defer { fixture.remove() }
+        let child = fixture.folder.appendingPathComponent("nested", isDirectory: true)
+        try FileManager.default.createDirectory(at: child, withIntermediateDirectories: false)
+        let image = child.appendingPathComponent("disc.iso")
+        try DiscFixture.playStationISO().write(to: image)
+
+        let scanned = try PlayStationTools.scanEntries([fixture.folder, image])
+        let row = try #require(scanned.first)
+        #expect(scanned.count == 1)
+        #expect(row.file.resolvingSymlinksInPath() == image.resolvingSymlinksInPath())
+        #expect(row.accessFolder == fixture.folder)
+        #expect(try PlayStationInspector.inspect(row.file).bootValid)
+    }
+
 }
