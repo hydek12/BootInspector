@@ -10,7 +10,7 @@ import SwiftUI
 @main
 struct BootInspectorApp: App {
     var body: some Scene {
-        WindowGroup {
+        Window("BootInspector", id: "inspector") {
             ContentView()
         }
     }

@@ -250,7 +250,7 @@ struct ContentView: View {
     @State private var alundraProfile = false
     @State private var cueRepair: PlayStationTools.CueRepair?
     @State private var batch: [PlayStationTools.ScanEntry]?
-    @State private var showingBatch = false
+    @State private var selectedDisc: URL?
     @State private var scanTask: Task<Void, Never>?
     @State private var gameDB: PlayStationCatalog?
     @State private var discDAT: PlayStationCatalog?
@@ -292,32 +292,23 @@ struct ContentView: View {
                 .keyboardShortcut("o", modifiers: .command)
             }
 
-            Picker("Disc type", selection: $playStationMode) {
+            Picker("Disc type", selection: Binding(get: { playStationMode }, set: { mode in
+                guard playStationMode != mode else { return }
+                playStationMode = mode
+                if let currentURL { analyze(url: currentURL) }
+            })) {
                 Text("Mac OS").tag(false)
                 Text("PlayStation").tag(true)
             }
             .pickerStyle(.segmented)
-            .onChange(of: playStationMode) {
-                if !showingBatch, let currentURL { analyze(url: currentURL) }
-            }
 
-            if let batch, !showingBatch {
-                Button("Back to Scan Results", systemImage: "chevron.left") {
-                    inspection?.cancel()
-                    inspecting = false
-                    showingBatch = true
-                    errorMessage = nil
-                    toolError = nil
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .disabled(batch.isEmpty)
+            if let batch, !batch.isEmpty {
+                discSelection(batch)
             }
 
             if scanTask != nil {
                 ProgressView("Scanning disc images…")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if showingBatch, let batch {
-                batchResults(batch)
             } else if inspecting {
                 ProgressView("Reading disc image…")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -340,9 +331,6 @@ struct ContentView: View {
         }
         .padding(20)
         .frame(minWidth: 680, minHeight: 500)
-        .sheet(isPresented: Binding(get: { cueRepair != nil }, set: { if !$0 { cueRepair = nil } })) {
-            if let cueRepair { cueRepairSheet(cueRepair) }
-        }
         .onDrop(of: [.fileURL], isTargeted: $isTargeted) { providers in
             handleDrop(providers: providers)
         }
@@ -527,7 +515,11 @@ struct ContentView: View {
             scanTask = nil
             batch = nil
         }
-        showingBatch = false
+        selectedDisc = entry?.id
+        currentURL = nil
+        psReport = nil
+        report = nil
+        cueRepair = nil
         inspecting = true
         errorMessage = nil
         toolError = nil
@@ -535,10 +527,15 @@ struct ContentView: View {
         trackFolder = folder
         inspection = Task {
             do {
-                let type = try await Task.detached(priority: .userInitiated) {
+                let (image, type) = try await Task.detached(priority: .userInitiated) {
                     let scoped = folder?.startAccessingSecurityScopedResource() ?? false
-                    defer { if scoped { folder?.stopAccessingSecurityScopedResource() } }
-                    return try DiscImageType.detect(url)
+                    let fileScoped = url.startAccessingSecurityScopedResource()
+                    defer {
+                        if scoped { folder?.stopAccessingSecurityScopedResource() }
+                        if fileScoped { url.stopAccessingSecurityScopedResource() }
+                    }
+                    let image = entry == nil ? PlayStationInspector.preferredCue(for: url) ?? url : url
+                    return (image, try DiscImageType.detect(image))
                 }.value
                 guard !Task.isCancelled else { return }
                 if type == .folder {
@@ -546,7 +543,7 @@ struct ContentView: View {
                     scanSelection([url])
                     return
                 }
-                currentURL = url
+                currentURL = image
                 detectedFormat = nil
                 let usePlayStation: Bool
                 switch type {
@@ -557,8 +554,8 @@ struct ContentView: View {
                 case .unknown: usePlayStation = playStationMode
                 case .folder: return
                 }
-                if usePlayStation != playStationMode { playStationMode = usePlayStation }
-                else { analyze(url: url) }
+                playStationMode = usePlayStation
+                analyze(url: image)
             } catch {
                 guard !Task.isCancelled else { return }
                 inspecting = false
@@ -770,7 +767,15 @@ struct ContentView: View {
             switch result {
             case .success(let entries):
                 batch = entries
-                showingBatch = true
+                if let entry = PlayStationTools.initialScanEntry(entries) {
+                    open(url: entry.file, from: entry)
+                } else {
+                    selectedDisc = nil
+                    currentURL = nil
+                    report = nil
+                    psReport = nil
+                    toolError = "No disc images were found."
+                }
             case .failure(let error):
                 toolError = error.localizedDescription
             }
@@ -795,7 +800,7 @@ struct ContentView: View {
         }
     }
 
-    private func cueRepairSheet(_ repair: PlayStationTools.CueRepair) -> some View {
+    private func cueRepairPreview(_ repair: PlayStationTools.CueRepair) -> some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Preview CUE Repair").font(.headline)
             infoRow("Missing file", repair.originalName)
@@ -829,7 +834,7 @@ struct ContentView: View {
                 }
             }
         }
-        .padding(20).frame(minWidth: 470)
+        .padding(6)
         .textSelection(.enabled)
     }
 
@@ -840,61 +845,42 @@ struct ContentView: View {
         return panel.runModal() == .OK ? panel.url : nil
     }
 
-    private func batchResults(_ entries: [PlayStationTools.ScanEntry]) -> some View {
-        let batch = entries.map(\.record)
-        return VStack(alignment: .leading, spacing: 12) {
-            Text("Disc Image Scan").font(.headline)
-            Text("\(batch.count) entries · \(batch.filter(\.bootVerified).count) verified boot entries")
-                .font(.subheadline)
-            List(entries) { item in
-                let entry = item.record
-                VStack(alignment: .leading, spacing: 3) {
-                    Button { open(url: item.file, from: item) } label: {
-                        Label(entry.path, systemImage: "opticaldisc").lineLimit(1)
-                    }
-                    .buttonStyle(.link)
-                    Text(([entry.format, entry.serial, entry.region].compactMap { $0 } +
-                          (entry.tracks > 0 ? ["\(entry.tracks) tracks"] : [])).joined(separator: " · "))
-                        .font(.caption).foregroundStyle(.secondary)
-                    if let title = entry.catalogTitle { Text(title).font(.caption) }
-                    ForEach([entry.catalogMatch, entry.libCrypt, entry.sbi].compactMap { $0 }, id: \.self) { detail in
-                        Text(detail).font(.caption).foregroundStyle(.secondary)
-                    }
-                    ForEach(Array(entry.notes.enumerated()), id: \.offset) { note in
-                        Text(note.element).font(.caption).foregroundStyle(.secondary)
+    private func discSelection(_ entries: [PlayStationTools.ScanEntry]) -> some View {
+        HStack {
+            if entries.count > 1 {
+                Picker("Disc", selection: Binding(get: { selectedDisc }, set: { id in
+                    guard id != selectedDisc, let entry = entries.first(where: { $0.id == id }) else { return }
+                    open(url: entry.file, from: entry)
+                })) {
+                    ForEach(entries) { item in
+                        Text(item.record.path).tag(Optional(item.id))
                     }
                 }
+                .accessibilityIdentifier("disc-selection")
             }
-            HStack {
-                Spacer()
-                Button("Clear Results") {
-                    self.batch = nil
-                    showingBatch = false
-                    currentURL = nil
-                    report = nil
-                    psReport = nil
-                }
-                Button("Export CSV…") {
-                    guard let url = exportDestination("Disc Image Scan.csv") else { return }
-                    do {
-                        try PlayStationTools.batchCSV(batch).write(to: url, atomically: true, encoding: .utf8)
-                    } catch {
-                        toolError = error.localizedDescription
-                    }
-                }
-                Button("Export JSON…") {
-                    guard let url = exportDestination("Disc Image Scan.json") else { return }
-                    do {
-                        let encoder = JSONEncoder()
-                        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-                        try encoder.encode(batch).write(to: url, options: .atomic)
-                    } catch {
-                        toolError = error.localizedDescription
-                    }
-                }
+            Spacer()
+            Menu("Export Scan") {
+                Button("CSV…") { exportScan(entries, asJSON: false) }
+                Button("JSON…") { exportScan(entries, asJSON: true) }
             }
+            .fixedSize()
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    private func exportScan(_ entries: [PlayStationTools.ScanEntry], asJSON: Bool) {
+        let records = entries.map(\.record)
+        guard let url = exportDestination(asJSON ? "Disc Image Scan.json" : "Disc Image Scan.csv") else { return }
+        do {
+            if asJSON {
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+                try encoder.encode(records).write(to: url, options: .atomic)
+            } else {
+                try PlayStationTools.batchCSV(records).write(to: url, atomically: true, encoding: .utf8)
+            }
+        } catch {
+            toolError = error.localizedDescription
+        }
     }
 
     private func playStationReportView(_ report: PlayStationReport) -> some View {
@@ -955,6 +941,9 @@ struct ContentView: View {
                     }
                     .textSelection(.enabled)
                     .padding(6)
+                }
+                if let cueRepair, cueRepair.source == report.file {
+                    GroupBox { cueRepairPreview(cueRepair) }
                 }
                 if !report.members.isEmpty {
                     GroupBox("Playlist discs") {

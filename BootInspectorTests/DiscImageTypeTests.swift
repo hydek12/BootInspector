@@ -62,4 +62,37 @@ struct DiscImageTypeTests {
         #expect(try PlayStationInspector.inspect(row.file).bootValid)
     }
 
+    @Test func folderAndCueBinDropOpenTheVerifiedCueFirst() throws {
+        let fixture = try DiscFixture()
+        defer { fixture.remove() }
+        let raw = try fixture.write("Game (Track 01).bin", DiscFixture.raw(DiscFixture.playStationISO()))
+        let cue = try fixture.write("Game.cue", DiscFixture.cue(file: raw.lastPathComponent))
+        let unverified = try fixture.write("A Unverified.iso", Data())
+
+        for selection in [[raw, cue], [fixture.folder], [unverified, raw, cue]] {
+            let entries = try PlayStationTools.scanEntries(selection)
+            let initial = try #require(PlayStationTools.initialScanEntry(entries))
+            #expect(initial.file.resolvingSymlinksInPath() == cue.resolvingSymlinksInPath())
+            #expect(initial.record.serial == "SLES-12345")
+            #expect(initial.record.bootVerified)
+            #expect(!entries.contains { $0.file.lastPathComponent == raw.lastPathComponent })
+        }
+
+        let invalidOnly = try PlayStationTools.scanEntries([unverified])
+        #expect(PlayStationTools.initialScanEntry(invalidOnly)?.file == unverified)
+        #expect(PlayStationTools.initialScanEntry([]) == nil)
+    }
+
+    @Test func openingOneBINFindsItsCueWithoutUsingAnUnrelatedNamesake() throws {
+        let fixture = try DiscFixture()
+        defer { fixture.remove() }
+        let raw = try fixture.write("Disc.bin", DiscFixture.raw(DiscFixture.playStationISO()))
+        _ = try fixture.write("Disc.cue", DiscFixture.cue(file: "Other.bin"))
+        let correct = try fixture.write("Multi Track.cue", DiscFixture.cue(file: raw.lastPathComponent))
+        #expect(PlayStationInspector.preferredCue(for: raw)?.resolvingSymlinksInPath() == correct.resolvingSymlinksInPath())
+
+        _ = try fixture.write("Also References Disc.cue", DiscFixture.cue(file: raw.lastPathComponent))
+        #expect(PlayStationInspector.preferredCue(for: raw) == nil)
+    }
+
 }

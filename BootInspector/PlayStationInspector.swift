@@ -262,6 +262,25 @@ nonisolated enum PlayStationInspector {
         report.tracks.sort { $0.id < $1.id }
     }
 
+    static func preferredCue(for file: URL) -> URL? {
+        guard file.pathExtension.lowercased() == "bin" else { return nil }
+        let parent = file.deletingLastPathComponent()
+        guard let siblings = try? FileManager.default.contentsOfDirectory(at: parent, includingPropertiesForKeys: nil,
+                                                                          options: .skipsHiddenFiles) else { return nil }
+        let basename = file.deletingPathExtension().lastPathComponent
+        let candidates = siblings.filter { $0.pathExtension.lowercased() == "cue" }
+        func referencesBIN(_ candidate: URL) -> Bool {
+            var report = PlayStationReport(file: candidate, format: "CUE")
+            guard (try? readCue(candidate, report: &report)) != nil else { return false }
+            return report.tracks.contains { $0.file.standardizedFileURL == file.standardizedFileURL }
+        }
+        if let namesake = candidates.first(where: {
+            $0.deletingPathExtension().lastPathComponent.caseInsensitiveCompare(basename) == .orderedSame
+        }), referencesBIN(namesake) { return namesake }
+        let matches = candidates.filter(referencesBIN)
+        return matches.count == 1 ? matches.first : nil
+    }
+
     private static func readCue(_ url: URL, report: inout PlayStationReport) throws {
         let text = try readDescriptor(url)
         var backing: URL?

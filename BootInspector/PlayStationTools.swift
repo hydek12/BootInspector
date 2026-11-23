@@ -41,6 +41,10 @@ nonisolated enum PlayStationTools {
         var id: URL { file.standardizedFileURL }
     }
 
+    static func initialScanEntry(_ entries: [ScanEntry]) -> ScanEntry? {
+        entries.first(where: { $0.record.bootVerified }) ?? entries.first
+    }
+
     static func batchCSV(_ records: [BatchRecord]) -> String {
         let header = "path,format,serial,region,boot_verified,tracks,notes,catalog_title,catalog_match,libcrypt,sbi"
         let rows = records.map { record in
