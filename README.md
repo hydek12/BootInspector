@@ -29,3 +29,16 @@ Use **Grant Track Folder Access** for companion files and **Calculate Track SHA-
 ### Bundle the native CHD decoder
 
 Build BootInspector in Xcode, then run `sh bundle-libchdr.sh /path/to/BootInspector.app` with CMake and the Xcode command-line tools available. The script builds a pinned libchdr revision for the app’s architectures, embeds its dylib, and signs the local build ad hoc by default. Pass a signing identity as the second argument if needed. Use a fresh local build as the input to the script. Native inspection decodes requested CD hunks directly from the CHD and leaves the source untouched.
+
+### Optional disc catalogs and LibCrypt
+
+Use **Disc Catalog** to load either or both reference files for the current app session. BootInspector reads the selected files locally.
+
+- **DuckStation GameDB** accepts DuckStation’s generated `gamedb.yaml`. It looks up the disc’s boot serial and known aliases for a title and a LibCrypt flag. A serial match can also identify a patched disc and does not determine its exact revision.
+- **Logiqx XML DAT** accepts a PlayStation DAT with complete, ordered per-track sizes and SHA-1 values. Use **Calculate Track SHA-1** to compare an individual disc, or **Scan Library** to compare tracks automatically when their sizes are in the DAT. Exact matching is available for layouts with accessible stored track boundaries. CHD, ECM, and cooked representations without matching track sizes may still provide a serial match when the GameDB is loaded.
+
+The SBI check reads the same-name companion and validates the header, BCD timestamps, record types, payload lengths, and overlapping records. A structurally valid SBI does not establish that its Q-channel data belongs to the disc. The app reports declared SUB or CHD subchannel data separately without validating its contents. Catalog status, LibCrypt, and SBI results are included in batch CSV and JSON exports.
+
+[DuckStation GameDB](https://github.com/stenzek/duckstation/blob/master/src/core/game_database.cpp) · [Redump LibCrypt notes](https://wiki.redump.info/LibCrypt)
+
+[SBI record format](https://psx-spx.consoledev.net/dev/ps1/cdr/cdromfileformats/diskimages/)

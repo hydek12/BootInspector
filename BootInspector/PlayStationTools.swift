@@ -27,15 +27,20 @@ nonisolated enum PlayStationTools {
         let bootVerified: Bool
         let tracks: Int
         let notes: [String]
+        var catalogTitle: String? = nil
+        var catalogMatch: String? = nil
+        var libCrypt: String? = nil
+        var sbi: String? = nil
     }
 
     static func batchCSV(_ records: [BatchRecord]) -> String {
-        let header = "path,format,serial,region,boot_verified,tracks,notes"
+        let header = "path,format,serial,region,boot_verified,tracks,notes,catalog_title,catalog_match,libcrypt,sbi"
         let rows = records.map { record in
             [
                 record.path, record.format, record.serial ?? "", record.region,
                 String(record.bootVerified), String(record.tracks),
-                record.notes.joined(separator: "\n")
+                record.notes.joined(separator: "\n"), record.catalogTitle ?? "",
+                record.catalogMatch ?? "", record.libCrypt ?? "", record.sbi ?? ""
             ].map { value in
                 let first = value.drop(while: \.isWhitespace).first
                 let escaped = value.replacingOccurrences(of: "\"", with: "\"\"")
@@ -148,7 +153,49 @@ nonisolated enum PlayStationTools {
         return CueRepair(source: url, originalName: originalName, replacementName: replacementName, serial: raw?.serial, data: data)
     }
 
-    static func scanLibrary(_ folder: URL) throws -> [BatchRecord] {
+    struct CatalogAssessment: Sendable {
+        let title: String?
+        let match: String?
+        let libCrypt: String
+        let sbi: String
+    }
+
+    static func assess(_ report: PlayStationReport, gameDB: PlayStationCatalog?,
+                       dat: PlayStationCatalog?, hashes: [Int: String] = [:]) -> CatalogAssessment {
+        let disc = report.serial.flatMap { gameDB?.discs[$0] }
+        let exact = dat?.match(report.tracks, hashes: hashes) ?? []
+        let match: String?
+        if !exact.isEmpty {
+            match = "Exact track SHA-1"
+        } else if let dat {
+            if report.tracks.isEmpty || report.tracks.contains(where: { $0.storedByteCount == nil }) {
+                match = "Track hashes unavailable for this layout"
+            } else if !dat.containsLayout(report.tracks) || hashes.count == report.tracks.count {
+                match = "No exact catalog match"
+            } else {
+                match = "Track SHA-1 comparison pending"
+            }
+        } else {
+            match = disc != nil ? "Serial match" : gameDB != nil ? "Serial absent from catalog" : nil
+        }
+
+        let hasSubchannel = report.hasSUB || report.embeddedSubchannel || report.tracks.contains { $0.sectorBytes == 2448 }
+        let libCrypt: String
+        if disc?.libCrypt == true {
+            switch report.sbi {
+            case .valid: libCrypt = "Catalog flags LibCrypt · SBI structure valid"
+            case .missing where hasSubchannel: libCrypt = "Catalog flags LibCrypt · other subchannel data declared, contents unverified"
+            case .missing: libCrypt = "Catalog flags LibCrypt · SBI missing or inaccessible"
+            case .invalid, .unreadable: libCrypt = "Catalog flags LibCrypt · SBI unusable"
+            }
+        } else {
+            libCrypt = disc == nil ? "Unknown · no serial match in a LibCrypt catalog" : "Serial match · no LibCrypt flag"
+        }
+        return CatalogAssessment(title: exact.isEmpty ? disc?.title : exact.joined(separator: " / "),
+                                 match: match, libCrypt: libCrypt, sbi: report.sbi.summary)
+    }
+
+    static func scanLibrary(_ folder: URL, gameDB: PlayStationCatalog? = nil, dat: PlayStationCatalog? = nil) throws -> [BatchRecord] {
         let scoped = folder.startAccessingSecurityScopedResource()
         defer { if scoped { folder.stopAccessingSecurityScopedResource() } }
         let primary: Set<String> = ["cue", "ccd", "iso", "chd", "m3u", "m3u8", "toc", "gdi", "nrg", "pbp", "ecm", "mds", "cso", "zso", "isz", "dax"]
@@ -159,12 +206,22 @@ nonisolated enum PlayStationTools {
         }
         var descriptors: [URL] = []
         var loose: [URL] = []
+        var companions: [String: PlayStationInspector.Companions] = [:]
         for case let file as URL in enumerator {
             try Task.checkCancellation()
             let ext = file.pathExtension.lowercased()
-            guard primary.contains(ext) || raw.contains(ext),
+            let sidecar = ext == "sbi" || ext == "sub"
+            guard sidecar || primary.contains(ext) || raw.contains(ext),
                   (try? file.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else { continue }
-            if primary.contains(ext) { descriptors.append(file) } else { loose.append(file) }
+            if sidecar {
+                let key = PlayStationInspector.Companions.key(for: file)
+                if ext == "sbi" { companions[key, default: .init()].sbi = file }
+                else { companions[key, default: .init()].sub = file }
+            } else if primary.contains(ext) {
+                descriptors.append(file)
+            } else {
+                loose.append(file)
+            }
         }
         let root = folder.standardizedFileURL.path + "/"
         var backing = Set<URL>()
@@ -172,12 +229,29 @@ nonisolated enum PlayStationTools {
             try Task.checkCancellation()
             let path = file.path.hasPrefix(root) ? String(file.path.dropFirst(root.count)) : file.lastPathComponent
             do {
-                let report = try PlayStationInspector.inspect(file)
+                let sidecars = companions[PlayStationInspector.Companions.key(for: file)] ?? .init()
+                let report = try PlayStationInspector.inspect(file, companions: sidecars)
                 if ["CUE", "CCD"].contains(report.format) {
                     backing.formUnion(report.tracks.map { $0.file.standardizedFileURL })
                 }
+                var hashes: [Int: String] = [:]
+                var notes = report.warnings
+                if dat?.containsLayout(report.tracks) == true {
+                    do {
+                        for track in report.tracks { hashes[track.id] = try PlayStationInspector.sha1(track) }
+                    } catch is CancellationError {
+                        throw CancellationError()
+                    } catch {
+                        notes.append("Could not compare track SHA-1: \(error.localizedDescription)")
+                    }
+                }
+                let assessment = assess(report, gameDB: gameDB, dat: dat, hashes: hashes)
                 return BatchRecord(path: path, format: report.format, serial: report.serial, region: report.region,
-                    bootVerified: report.bootValid, tracks: report.tracks.count, notes: report.warnings)
+                    bootVerified: report.bootValid, tracks: report.tracks.count, notes: notes,
+                    catalogTitle: assessment.title, catalogMatch: assessment.match,
+                    libCrypt: assessment.libCrypt, sbi: assessment.sbi)
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
                 return BatchRecord(path: path, format: file.pathExtension.uppercased(), serial: nil, region: "Unknown",
                     bootVerified: false, tracks: 0, notes: [error.localizedDescription])

@@ -245,6 +245,8 @@ struct ContentView: View {
     @State private var alundraProfile = false
     @State private var cueRepair: PlayStationTools.CueRepair?
     @State private var batch: [PlayStationTools.BatchRecord]?
+    @State private var gameDB: PlayStationCatalog?
+    @State private var discDAT: PlayStationCatalog?
     @State private var sectorSummary: CDSectorIntegrity.Summary?
     @State private var toolBusy = false
     @State private var toolError: String?
@@ -268,6 +270,17 @@ struct ContentView: View {
                 }
                 Spacer()
                 if playStationMode {
+                    Menu("Disc Catalog") {
+                        Button("Load DuckStation GameDB…") { loadCatalog(gameDB: true) }
+                        Button("Load Logiqx XML DAT…") { loadCatalog(gameDB: false) }
+                        if gameDB != nil || discDAT != nil {
+                            Button("Clear Catalogs") {
+                                gameDB = nil
+                                discDAT = nil
+                            }
+                        }
+                    }
+                    .disabled(toolBusy)
                     Button(toolBusy ? "Working…" : "Scan Library…") { scanLibrary() }
                         .disabled(toolBusy)
                 }
@@ -640,15 +653,37 @@ struct ContentView: View {
         }
     }
 
+    private func loadCatalog(gameDB isGameDB: Bool) {
+        let panel = NSOpenPanel()
+        panel.prompt = "Load Catalog"
+        panel.allowedContentTypes = (isGameDB ? ["yaml", "yml"] : ["xml", "dat"])
+            .compactMap { UTType(filenameExtension: $0) }
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        toolBusy = true
+        toolError = nil
+        Task {
+            defer { toolBusy = false }
+            do {
+                let catalog = try await Task.detached(priority: .utility) { try PlayStationCatalog(url: url) }.value
+                guard isGameDB == !catalog.discs.isEmpty else {
+                    throw PlayStationInspector.InspectionError("Choose the load command that matches this catalog format.")
+                }
+                if isGameDB { gameDB = catalog } else { discDAT = catalog }
+            } catch { toolError = error.localizedDescription }
+        }
+    }
+
     private func scanLibrary() {
         guard let folder = selectFolder("Scan Disc Library") else { return }
+        let gameDB = gameDB
+        let dat = discDAT
         toolBusy = true
         toolError = nil
         Task {
             defer { toolBusy = false }
             do {
                 batch = try await Task.detached(priority: .utility) {
-                    try PlayStationTools.scanLibrary(folder)
+                    try PlayStationTools.scanLibrary(folder, gameDB: gameDB, dat: dat)
                 }.value
             } catch { toolError = error.localizedDescription }
         }
@@ -728,6 +763,10 @@ struct ContentView: View {
                     Text(entry.path).lineLimit(1)
                     Text([entry.serial ?? entry.format, entry.region, "\(entry.tracks) tracks"].joined(separator: " · "))
                         .font(.caption).foregroundStyle(.secondary)
+                    if let title = entry.catalogTitle { Text(title).font(.caption) }
+                    ForEach([entry.catalogMatch, entry.libCrypt, entry.sbi].compactMap { $0 }, id: \.self) { detail in
+                        Text(detail).font(.caption).foregroundStyle(.secondary)
+                    }
                     ForEach(Array(entry.notes.enumerated()), id: \.offset) { note in
                         Text(note.element).font(.caption).foregroundStyle(.secondary)
                     }
@@ -801,8 +840,20 @@ struct ContentView: View {
                         }
                         infoRow("ISO 9660 volume", report.volume ?? "Unavailable")
                         infoRow("Boot path", report.bootPath ?? "Unavailable")
-                        infoRow("SBI companion", report.hasSBI ? "Present" : "Not found or inaccessible")
-                        if report.hasSUB { infoRow("SUB companion", "Present") }
+                        let catalog = PlayStationTools.assess(report, gameDB: gameDB, dat: discDAT, hashes: hashes)
+                        if let gameDB { infoRow("Serial catalog", gameDB.name) }
+                        if let discDAT { infoRow("Track catalog", discDAT.name) }
+                        if let title = catalog.title {
+                            infoRow(catalog.match == "Exact track SHA-1" ? "Catalog release" : "Catalog title by serial", title)
+                        }
+                        if let match = catalog.match { infoRow("Catalog match", match) }
+                        infoRow("LibCrypt", catalog.libCrypt)
+                        infoRow("SBI companion", catalog.sbi)
+                        if report.sbi == .missing, !["CUE", "CCD", "TOC", "GDI", "M3U", "M3U8"].contains(report.format) {
+                            Button("Grant Companion Folder Access…") { grantTrackFolder(for: report.file) }
+                        }
+                        if report.hasSUB { infoRow("SUB companion", "Present · contents unverified") }
+                        if report.embeddedSubchannel { infoRow("CHD subchannel data", "Declared · contents unverified") }
                         if let details = report.bootDetails { infoRow("PS-X EXE", details) }
                     }
                     .textSelection(.enabled)

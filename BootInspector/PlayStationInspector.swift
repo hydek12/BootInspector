@@ -12,6 +12,13 @@ nonisolated struct PlayStationTrack: Identifiable, Sendable {
     var start: Int?
     var frames: Int?
 
+    var completeSectors = true
+
+    var storedByteCount: Int? {
+        guard completeSectors, index01 != nil, let frames, let sectorBytes else { return nil }
+        return (frames + storedPregap) * sectorBytes
+    }
+
     var storedPregap: Int { max(0, (index01 ?? 0) - (index00 ?? index01 ?? 0)) }
 }
 
@@ -28,7 +35,8 @@ nonisolated struct PlayStationReport: Sendable {
     var config: String?
     var regions: [String: String] = [:]
     var warnings: [String] = []
-    var hasSBI = false
+    var sbi: PlayStationSBI = .missing
+    var embeddedSubchannel = false
     var hasSUB = false
     var members: [URL] = []
 
@@ -68,14 +76,25 @@ nonisolated enum PlayStationInspector {
         "MODE2/2336": 2336, "MODE2/2352": 2352, "MODE2/2448": 2448, "MODE1/2448": 2448, "CDI/2336": 2336, "CDI/2352": 2352
     ]
 
+    struct Companions {
+        var sbi: URL?
+        var sub: URL?
+
+        static func key(for file: URL) -> String {
+            file.deletingLastPathComponent().standardizedFileURL.path + "/" +
+                file.deletingPathExtension().lastPathComponent.lowercased()
+        }
+    }
+
     static func inspect(_ url: URL, chdLibrary: URL? = Bundle.main.privateFrameworksURL?
-        .appendingPathComponent("libchdr.dylib")) throws -> PlayStationReport {
+        .appendingPathComponent("libchdr.dylib"), companions: Companions? = nil) throws -> PlayStationReport {
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
         let kind = url.pathExtension.lowercased()
         var report = PlayStationReport(file: url, format: kind.uppercased())
-        report.hasSBI = companion(url, extension: "sbi") != nil
-        report.hasSUB = companion(url, extension: "sub") != nil
+        let sidecars = companions ?? Companions(sbi: companion(url, extension: "sbi"), sub: companion(url, extension: "sub"))
+        report.sbi = PlayStationSBI.inspect(sidecars.sbi)
+        report.hasSUB = sidecars.sub != nil
         switch kind {
         case "chd":
             try inspectCHD(url, library: chdLibrary, report: &report)
@@ -163,7 +182,10 @@ nonisolated enum PlayStationInspector {
             let file = parent.appendingPathComponent(base).appendingPathExtension(ext)
             if FileManager.default.fileExists(atPath: file.path) { return file }
         }
-        return nil
+        let contents = try? FileManager.default.contentsOfDirectory(at: parent, includingPropertiesForKeys: nil)
+        return contents?.first {
+            $0.lastPathComponent.caseInsensitiveCompare(base + "." + suffix) == .orderedSame
+        }
     }
 
     private static func readDescriptor(_ url: URL) throws -> String {
@@ -305,7 +327,10 @@ nonisolated enum PlayStationInspector {
                 discFrame = nil
                 continue
             }
-            if size % stride != 0 { report.warnings.append("Track \(track.id) backing file ends with a partial sector.") }
+            if size % stride != 0 {
+                report.tracks[i].completeSectors = false
+                report.warnings.append("Track \(track.id) backing file ends with a partial sector.")
+            }
             let start = discFrame.map { $0 + track.pregap + track.storedPregap }
             report.tracks[i].start = start
             report.tracks[i].frames = end - begin
@@ -482,6 +507,7 @@ nonisolated enum PlayStationInspector {
                 let gap = fields["PREGAP"].flatMap(Int.init) ?? 0
                 let postgap = fields["POSTGAP"].flatMap(Int.init) ?? 0
                 guard (0...frames).contains(gap), (0...1_000_000).contains(postgap) else { throw InspectionError("Invalid CHD gap length.") }
+                if ["RW", "RW_RAW"].contains(fields["SUBTYPE"] ?? "") { report.embeddedSubchannel = true }
                 let stored = fields["PGTYPE"]?.hasPrefix("V") == true
                 let mode = ["MODE2_RAW":"MODE2/2352", "MODE1_RAW":"MODE1/2352", "MODE1":"MODE1/2048", "MODE2":"MODE2/2336"][type] ?? type
                 report.tracks.append(PlayStationTrack(id: number, type: mode, file: url, sectorBytes: sectorSizes[mode],
