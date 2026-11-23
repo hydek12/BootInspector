@@ -8,7 +8,7 @@ Open `BootInspector.xcodeproj` in Xcode 27.2 and build the BootInspector scheme.
 
 ## PlayStation disc inspection
 
-Use **PlayStation** mode for raw images or cooked ISO. The app detects raw sector layouts by content, including 2,352-byte sectors and 2,448-byte sectors with subchannel data. Opening a CUE, CHD, CCD, ECM, or playlist selects PlayStation mode automatically.
+Drop an image to select its inspection mode automatically. BootInspector checks signatures and filesystem data to distinguish Mac OS, generic ISO 9660, and PlayStation images, including cooked and raw layouts. Drop several files or a folder to scan the selection recursively with the detected formats shown per disc.
 
 | Input | Inspection |
 |---|---|
@@ -35,7 +35,7 @@ Build BootInspector in Xcode, then run `sh bundle-libchdr.sh /path/to/BootInspec
 Use **Disc Catalog** to load either or both reference files for the current app session. BootInspector reads the selected files locally.
 
 - **DuckStation GameDB** accepts DuckStation’s generated `gamedb.yaml`. It looks up the disc’s boot serial and known aliases for a title and a LibCrypt flag. A serial match can also identify a patched disc and does not determine its exact revision.
-- **Logiqx XML DAT** accepts a PlayStation DAT with complete, ordered per-track sizes and SHA-1 values. Use **Calculate Track SHA-1** to compare an individual disc, or **Scan Library** to compare tracks automatically when their sizes are in the DAT. Exact matching is available for layouts with accessible stored track boundaries. CHD, ECM, and cooked representations without matching track sizes may still provide a serial match when the GameDB is loaded.
+- **Logiqx XML DAT** accepts a PlayStation DAT with complete, ordered per-track sizes and SHA-1 values. Use **Calculate Track SHA-1** to compare an individual disc, or **Scan Library** to compare tracks automatically when their sizes are in the DAT. Exact matching is available for layouts with accessible stored track boundaries. Native CD CHDs can match a DAT directly. Track hashes include stored pregaps, exclude CHD hunk padding and subcode, and convert CD audio to BIN byte order. Mixed-mode stored pregaps and other layouts without comparable track boundaries may still provide a serial match when the GameDB is loaded.
 
 The SBI check reads the same-name companion and validates the header, BCD timestamps, record types, payload lengths, and overlapping records. A structurally valid SBI does not establish that its Q-channel data belongs to the disc. The app reports declared SUB or CHD subchannel data separately without validating its contents. Catalog status, LibCrypt, and SBI results are included in batch CSV and JSON exports.
 

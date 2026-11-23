@@ -196,41 +196,93 @@ nonisolated enum PlayStationTools {
     }
 
     static func scanLibrary(_ folder: URL, gameDB: PlayStationCatalog? = nil, dat: PlayStationCatalog? = nil) throws -> [BatchRecord] {
-        let scoped = folder.startAccessingSecurityScopedResource()
-        defer { if scoped { folder.stopAccessingSecurityScopedResource() } }
-        let primary: Set<String> = ["cue", "ccd", "iso", "chd", "m3u", "m3u8", "toc", "gdi", "nrg", "pbp", "ecm", "mds", "cso", "zso", "isz", "dax"]
-        let raw: Set<String> = ["img", "bin", "mdf", "raw", "2352", "2448"]
-        guard let enumerator = FileManager.default.enumerator(at: folder, includingPropertiesForKeys: [.isRegularFileKey],
-                                                              options: [.skipsHiddenFiles, .skipsPackageDescendants]) else {
-            throw PlayStationInspector.InspectionError("The disc library folder could not be opened.")
-        }
+        try scanSelection([folder], gameDB: gameDB, dat: dat)
+    }
+
+    static func scanSelection(_ selection: [URL], gameDB: PlayStationCatalog? = nil,
+                              dat: PlayStationCatalog? = nil) throws -> [BatchRecord] {
+        let accessed = selection.filter { $0.startAccessingSecurityScopedResource() }
+        defer { accessed.forEach { $0.stopAccessingSecurityScopedResource() } }
+        let extensions: Set<String> = ["iso", "chd", "ecm", "img", "bin", "mdf", "raw", "2352", "2448",
+                                       "toast", "cdr", "dmg"]
+        let keys: Set<URLResourceKey> = [.isDirectoryKey, .isRegularFileKey]
         var descriptors: [URL] = []
         var loose: [URL] = []
         var companions: [String: PlayStationInspector.Companions] = [:]
-        for case let file as URL in enumerator {
+        var seen = Set<String>()
+        var explicit = Set<String>()
+        var relativeRoot: URL?
+
+        func add(_ file: URL, explicitlySelected: Bool) throws {
             try Task.checkCancellation()
+            let path = file.standardizedFileURL.path
+            if explicitlySelected { explicit.insert(path) }
+            guard seen.insert(path).inserted else { return }
             let ext = file.pathExtension.lowercased()
-            let sidecar = ext == "sbi" || ext == "sub"
-            guard sidecar || primary.contains(ext) || raw.contains(ext),
-                  (try? file.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else { continue }
-            if sidecar {
+            if ext == "sbi" || ext == "sub" {
                 let key = PlayStationInspector.Companions.key(for: file)
                 if ext == "sbi" { companions[key, default: .init()].sbi = file }
                 else { companions[key, default: .init()].sub = file }
-            } else if primary.contains(ext) {
+            } else if DiscImageType.descriptors.contains(ext) {
                 descriptors.append(file)
             } else {
                 loose.append(file)
             }
         }
-        let root = folder.standardizedFileURL.path + "/"
+
+        for item in selection {
+            let info = try item.resourceValues(forKeys: keys)
+            guard info.isDirectory == true else {
+                try add(item, explicitlySelected: true)
+                continue
+            }
+            if selection.count == 1 { relativeRoot = item.standardizedFileURL }
+            guard let enumerator = FileManager.default.enumerator(at: item, includingPropertiesForKeys: Array(keys),
+                                                                  options: [.skipsHiddenFiles]) else {
+                throw PlayStationInspector.InspectionError("The disc library folder could not be opened.")
+            }
+            for case let file as URL in enumerator {
+                try Task.checkCancellation()
+                let suffix = file.pathExtension.lowercased()
+                guard suffix.isEmpty || extensions.contains(suffix) || DiscImageType.descriptors.contains(suffix) ||
+                    suffix == "sbi" || suffix == "sub" else { continue }
+                if (try? file.resourceValues(forKeys: keys).isRegularFile) == true {
+                    try add(file, explicitlySelected: false)
+                }
+            }
+        }
+        let root = relativeRoot.map { $0.resolvingSymlinksInPath().pathComponents }
         var backing = Set<URL>()
-        func inspect(_ file: URL) throws -> BatchRecord {
+        func inspect(_ file: URL) throws -> BatchRecord? {
             try Task.checkCancellation()
-            let path = file.path.hasPrefix(root) ? String(file.path.dropFirst(root.count)) : file.lastPathComponent
+            let path: String
+            if let root {
+                let components = file.resolvingSymlinksInPath().pathComponents
+                path = components.starts(with: root)
+                    ? components.dropFirst(root.count).joined(separator: "/")
+                    : file.lastPathComponent
+            } else {
+                path = selection.count > 1 ? file.path : file.lastPathComponent
+            }
+            let ext = file.pathExtension.lowercased()
+            let selected = explicit.contains(file.standardizedFileURL.path)
+            let candidate = selected || (!DiscImageType.signatureRequired.contains(ext) &&
+                (extensions.contains(ext) || DiscImageType.descriptors.contains(ext)))
             do {
-                let sidecars = companions[PlayStationInspector.Companions.key(for: file)] ?? .init()
-                let report = try PlayStationInspector.inspect(file, companions: sidecars)
+                let type = try DiscImageType.detect(file, requireContainerSignature: !selected)
+                let format: String?
+                switch type {
+                case .mac, .iso9660:
+                    let image = try DiskImageInspector.inspect(url: file)
+                    return BatchRecord(path: path, format: type == .mac ? "Mac OS" : "ISO 9660",
+                                       serial: nil, region: "—", bootVerified: image.isBootablePPC,
+                                       tracks: 0, notes: [image.verdictTitle])
+                case .playStation(let detected): format = detected
+                case .unknown where candidate: format = nil
+                default: return nil
+                }
+                let sidecars = relativeRoot == nil ? nil : (companions[PlayStationInspector.Companions.key(for: file)] ?? .init())
+                let report = try PlayStationInspector.inspect(file, companions: sidecars, detectedFormat: format)
                 if ["CUE", "CCD"].contains(report.format) {
                     backing.formUnion(report.tracks.map { $0.file.standardizedFileURL })
                 }
@@ -238,7 +290,7 @@ nonisolated enum PlayStationTools {
                 var notes = report.warnings
                 if dat?.containsLayout(report.tracks) == true {
                     do {
-                        for track in report.tracks { hashes[track.id] = try PlayStationInspector.sha1(track) }
+                        hashes = try PlayStationInspector.trackHashes(report)
                     } catch is CancellationError {
                         throw CancellationError()
                     } catch {
@@ -253,12 +305,13 @@ nonisolated enum PlayStationTools {
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
+                guard candidate else { return nil }
                 return BatchRecord(path: path, format: file.pathExtension.uppercased(), serial: nil, region: "Unknown",
                     bootVerified: false, tracks: 0, notes: [error.localizedDescription])
             }
         }
-        let descriptorReports = try descriptors.map(inspect)
-        let rawReports = try loose.filter { !backing.contains($0.standardizedFileURL) }.map(inspect)
+        let descriptorReports = try descriptors.compactMap(inspect)
+        let rawReports = try loose.filter { !backing.contains($0.standardizedFileURL) }.compactMap(inspect)
         return (descriptorReports + rawReports).sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
     }
 }

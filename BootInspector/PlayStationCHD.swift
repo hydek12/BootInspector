@@ -1,3 +1,4 @@
+import CryptoKit
 import Darwin
 import Foundation
 
@@ -68,8 +69,40 @@ nonisolated final class PlayStationCHD {
     }
 
     func sector(frame: Int, payloadOffset: Int) throws -> Data {
+        let start = try frameOffset(frame, offset: payloadOffset, count: 2048)
+        return Data(buffer[start..<(start + 2048)])
+    }
+
+    func sha1(firstFrame: Int, frames: Int, sectorBytes: Int, audio: Bool) throws -> String {
+        guard firstFrame >= 0, frames > 0, sectorBytes > 0, sectorBytes <= 2352,
+              (!audio || sectorBytes == 2352),
+              UInt64(firstFrame) + UInt64(frames) <= logicalBytes / UInt64(Self.frameSize) else {
+            throw PlayStationInspector.InspectionError("Invalid or incomplete CHD track storage.")
+        }
+        var hash = Insecure.SHA1()
+        var audioSector = [UInt8](repeating: 0, count: audio ? sectorBytes : 0)
+        for frame in firstFrame..<(firstFrame + frames) {
+            if frame.isMultiple(of: 256) { try Task.checkCancellation() }
+            let start = try frameOffset(frame, offset: 0, count: sectorBytes)
+            if audio {
+                // CHD CDDA uses big-endian samples. BIN catalogs hash little-endian samples.
+                for sample in stride(from: 0, to: sectorBytes, by: 2) {
+                    audioSector[sample] = buffer[start + sample + 1]
+                    audioSector[sample + 1] = buffer[start + sample]
+                }
+                audioSector.withUnsafeBytes { hash.update(bufferPointer: $0) }
+            } else {
+                buffer.withUnsafeBytes { bytes in
+                    hash.update(bufferPointer: UnsafeRawBufferPointer(rebasing: bytes[start..<(start + sectorBytes)]))
+                }
+            }
+        }
+        return hash.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func frameOffset(_ frame: Int, offset: Int, count: Int) throws -> Int {
         guard frame >= 0, UInt64(frame) < logicalBytes / UInt64(Self.frameSize),
-              (0...(Self.frameSize - 2048)).contains(payloadOffset) else {
+              offset >= 0, offset <= Self.frameSize - count else {
             throw PlayStationInspector.InspectionError("CHD sector is outside the stored CD frames.")
         }
         let byte = frame * Self.frameSize
@@ -82,7 +115,6 @@ nonisolated final class PlayStationCHD {
             }
             cachedHunk = hunk
         }
-        let start = byte % buffer.count + payloadOffset
-        return Data(buffer[start..<(start + 2048)])
+        return byte % buffer.count + offset
     }
 }

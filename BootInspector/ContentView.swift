@@ -5,12 +5,12 @@ import UniformTypeIdentifiers
 // MARK: - Binary Data Helpers
 
 extension Data {
-    func readUInt16BE(at offset: Int) -> UInt16? {
+    nonisolated func readUInt16BE(at offset: Int) -> UInt16? {
         guard offset >= 0, offset <= count - 2 else { return nil }
         return (UInt16(self[offset]) << 8) | UInt16(self[offset + 1])
     }
 
-    func readUInt32BE(at offset: Int) -> UInt32? {
+    nonisolated func readUInt32BE(at offset: Int) -> UInt32? {
         guard offset >= 0, offset <= count - 4 else { return nil }
         return (UInt32(self[offset]) << 24) |
                (UInt32(self[offset + 1]) << 16) |
@@ -18,7 +18,7 @@ extension Data {
                UInt32(self[offset + 3])
     }
 
-    func readASCII(at offset: Int, length: Int) -> String {
+    nonisolated func readASCII(at offset: Int, length: Int) -> String {
         guard offset >= 0, length >= 0, offset <= count, length <= count - offset else { return "" }
         let slice = self[offset..<(offset + length)]
         let trimmed = slice.prefix { $0 != 0 }
@@ -29,7 +29,7 @@ extension Data {
 
 // MARK: - Inspection Models
 
-struct PartitionRecord: Identifiable {
+nonisolated struct PartitionRecord: Identifiable {
     let id: Int              // 1-based partition number (matches OpenBIOS cd:X)
     let name: String
     let type: String
@@ -42,7 +42,7 @@ struct PartitionRecord: Identifiable {
     let blessedFolderID: UInt32?
 }
 
-struct ImageReport {
+nonisolated struct ImageReport {
     let fileName: String
     let fileSize: UInt64
     let hasDriverDescriptorMap: Bool
@@ -60,7 +60,7 @@ struct ImageReport {
 
 // MARK: - Binary Image Parser
 
-struct DiskImageInspector {
+nonisolated struct DiskImageInspector {
     static func inspect(url: URL) throws -> ImageReport {
         let accessed = url.startAccessingSecurityScopedResource()
         defer { if accessed { url.stopAccessingSecurityScopedResource() } }
@@ -80,9 +80,12 @@ struct DiskImageInspector {
         let ddmBlockSize = hasDDM ? (headerData.readUInt16BE(at: 2) ?? 512) : 512
 
         // 2. Check ISO-9660 Primary Volume Descriptor at offset 0x8000 (32768)
-        let isoMagic = headerData.readASCII(at: 0x8001, length: 5)
-        let hasISO = (isoMagic == "CD001")
-        let isoVolID = hasISO ? headerData.readASCII(at: 0x8028, length: 32) : ""
+        let volumeOffset = [0x8000, 16 * 2352 + 16, 16 * 2352 + 24, 16 * 2448 + 16,
+                            16 * 2448 + 24, 16 * 2336 + 8].first {
+            headerData.readASCII(at: $0 + 1, length: 5) == "CD001"
+        }
+        let hasISO = volumeOffset != nil
+        let isoVolID = volumeOffset.map { headerData.readASCII(at: $0 + 40, length: 32) } ?? ""
 
         // 3. Detect Apple Partition Map ("PM" = 0x504D) at 512-byte or 2048-byte stride
         var apmStride = 0
@@ -237,6 +240,7 @@ struct ContentView: View {
     @State private var playStationMode = false
     @State private var psReport: PlayStationReport?
     @State private var currentURL: URL?
+    @State private var detectedFormat: String?
     @State private var trackFolder: URL?
     @State private var inspection: Task<Void, Never>?
     @State private var hashes: [Int: String] = [:]
@@ -252,11 +256,6 @@ struct ContentView: View {
     @State private var toolBusy = false
     @State private var toolError: String?
     @State private var isTargeted = false
-
-    private let playStationExtensions: Set<String> = [
-        "cue", "chd", "ccd", "m3u", "m3u8", "mds", "mdf", "toc", "nrg",
-        "gdi", "pbp", "ecm", "cso", "zso", "isz", "dax", "raw", "2352", "2448"
-    ]
 
     var body: some View {
         VStack(spacing: 16) {
@@ -338,10 +337,10 @@ struct ContentView: View {
             Image(systemName: "opticaldisc")
                 .font(.system(size: 44))
                 .foregroundColor(isTargeted ? .accentColor : .secondary)
-            Text(playStationMode ? "Drop a PlayStation disc image here" : "Drop a Mac OS .iso, .toast, or .img file here")
+            Text("Drop disc images or a folder here")
                 .font(.title3)
                 .fontWeight(.medium)
-            Text(playStationMode ? "Open CUE/BIN, raw images, ISO, CHD, CloneCD, or a disc playlist." : "Checks Block 0 DDM, Apple Partition Map (APM), ISO-9660 descriptors, and HFS/HFS+ System Folder blessing")
+            Text("BootInspector detects Mac OS, ISO 9660, and PlayStation images.")
                 .font(.caption)
                 .foregroundColor(.secondary)
                 .multilineTextAlignment(.center)
@@ -474,7 +473,7 @@ struct ContentView: View {
     private func pickFile() {
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = false
-        panel.canChooseDirectories = false
+        panel.canChooseDirectories = true
         panel.allowedContentTypes = [.item]
         if panel.runModal() == .OK, let url = panel.url {
             open(url: url)
@@ -482,23 +481,61 @@ struct ContentView: View {
     }
 
     private func handleDrop(providers: [NSItemProvider]) -> Bool {
-        guard let provider = providers.first else { return false }
-        _ = provider.loadObject(ofClass: URL.self) { url, _ in
-            guard let url else { return }
-            DispatchQueue.main.async {
-                open(url: url)
+        let files = providers.filter { $0.canLoadObject(ofClass: URL.self) }
+        guard !files.isEmpty else { return false }
+        let pending = DispatchGroup()
+        var urls: [Int: URL] = [:]
+        for (index, provider) in files.enumerated() {
+            pending.enter()
+            _ = provider.loadObject(ofClass: URL.self) { url, _ in
+                DispatchQueue.main.async {
+                    if let url, url.isFileURL { urls[index] = url }
+                    pending.leave()
+                }
             }
+        }
+        pending.notify(queue: .main) {
+            let selection = urls.keys.sorted().compactMap { urls[$0] }
+            if selection.count == 1, let file = selection.first { open(url: file) }
+            else if !selection.isEmpty { scanSelection(selection) }
+            else { toolError = "The dropped files could not be opened." }
         }
         return true
     }
 
     private func open(url: URL) {
-        currentURL = url
+        inspection?.cancel()
+        inspecting = true
+        errorMessage = nil
+        toolError = nil
         trackFolder = nil
-        if playStationExtensions.contains(url.pathExtension.lowercased()), !playStationMode {
-            playStationMode = true
-        } else {
-            analyze(url: url)
+        inspection = Task {
+            do {
+                let type = try await Task.detached(priority: .userInitiated) { try DiscImageType.detect(url) }.value
+                guard !Task.isCancelled else { return }
+                if type == .folder {
+                    inspecting = false
+                    scanSelection([url])
+                    return
+                }
+                currentURL = url
+                detectedFormat = nil
+                let usePlayStation: Bool
+                switch type {
+                case .playStation(let format):
+                    detectedFormat = format
+                    usePlayStation = true
+                case .mac, .iso9660: usePlayStation = false
+                case .unknown: usePlayStation = playStationMode
+                case .folder: return
+                }
+                if usePlayStation != playStationMode { playStationMode = usePlayStation }
+                else { analyze(url: url) }
+            } catch {
+                guard !Task.isCancelled else { return }
+                inspecting = false
+                errorMessage = error.localizedDescription
+            }
         }
     }
 
@@ -515,12 +552,13 @@ struct ContentView: View {
         if playStationMode {
             inspecting = true
             let folder = trackFolder
+            let format = detectedFormat
             inspection = Task {
                 do {
                     let result = try await Task.detached(priority: .userInitiated) {
                         let scoped = folder?.startAccessingSecurityScopedResource() ?? false
                         defer { if scoped { folder?.stopAccessingSecurityScopedResource() } }
-                        return try PlayStationInspector.inspect(url)
+                        return try PlayStationInspector.inspect(url, detectedFormat: format)
                     }.value
                     guard !Task.isCancelled else { return }
                     psReport = result
@@ -564,11 +602,7 @@ struct ContentView: View {
                     if scoped { folder?.stopAccessingSecurityScopedResource() }
                     if imageScope { report.file.stopAccessingSecurityScopedResource() }
                 }
-                var result: [Int: String] = [:]
-                for track in report.tracks where track.frames != nil {
-                    result[track.id] = try PlayStationInspector.sha1(track)
-                }
-                return result
+                return try PlayStationInspector.trackHashes(report)
             }
             do {
                 let result = try await withTaskCancellationHandler {
@@ -676,6 +710,14 @@ struct ContentView: View {
 
     private func scanLibrary() {
         guard let folder = selectFolder("Scan Disc Library") else { return }
+        scanSelection([folder])
+    }
+
+    private func scanSelection(_ urls: [URL]) {
+        guard !toolBusy else {
+            toolError = "Wait for the current library tool to finish."
+            return
+        }
         let gameDB = gameDB
         let dat = discDAT
         toolBusy = true
@@ -684,7 +726,7 @@ struct ContentView: View {
             defer { toolBusy = false }
             do {
                 batch = try await Task.detached(priority: .utility) {
-                    try PlayStationTools.scanLibrary(folder, gameDB: gameDB, dat: dat)
+                    try PlayStationTools.scanSelection(urls, gameDB: gameDB, dat: dat)
                 }.value
             } catch { toolError = error.localizedDescription }
         }
@@ -733,8 +775,7 @@ struct ContentView: View {
                         do {
                             try repair.data.write(to: destination, options: .withoutOverwriting)
                             cueRepair = nil
-                            currentURL = destination
-                            analyze(url: destination)
+                            open(url: destination)
                         } catch {
                             toolError = error.localizedDescription
                             cueRepair = nil
@@ -756,13 +797,14 @@ struct ContentView: View {
 
     private func batchSheet(_ batch: [PlayStationTools.BatchRecord]) -> some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("PlayStation Library Scan").font(.headline)
+            Text("Disc Image Scan").font(.headline)
             Text("\(batch.count) entries · \(batch.filter(\.bootVerified).count) verified boot entries")
                 .font(.subheadline)
             List(batch, id: \.path) { entry in
                 VStack(alignment: .leading, spacing: 3) {
                     Text(entry.path).lineLimit(1)
-                    Text([entry.serial ?? entry.format, entry.region, "\(entry.tracks) tracks"].joined(separator: " · "))
+                    Text(([entry.format, entry.serial, entry.region].compactMap { $0 } +
+                          (entry.tracks > 0 ? ["\(entry.tracks) tracks"] : [])).joined(separator: " · "))
                         .font(.caption).foregroundStyle(.secondary)
                     if let title = entry.catalogTitle { Text(title).font(.caption) }
                     ForEach([entry.catalogMatch, entry.libCrypt, entry.sbi].compactMap { $0 }, id: \.self) { detail in
@@ -777,7 +819,7 @@ struct ContentView: View {
                 Spacer()
                 Button("Close") { self.batch = nil }
                 Button("Export CSV…") {
-                    guard let url = exportDestination("PlayStation Library.csv") else { return }
+                    guard let url = exportDestination("Disc Image Scan.csv") else { return }
                     do {
                         try PlayStationTools.batchCSV(batch).write(to: url, atomically: true, encoding: .utf8)
                     } catch {
@@ -786,7 +828,7 @@ struct ContentView: View {
                     }
                 }
                 Button("Export JSON…") {
-                    guard let url = exportDestination("PlayStation Library.json") else { return }
+                    guard let url = exportDestination("Disc Image Scan.json") else { return }
                     do {
                         let encoder = JSONEncoder()
                         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -866,6 +908,7 @@ struct ContentView: View {
                             ForEach(Array(report.members.enumerated()), id: \.offset) { member in
                                 Button("Disc \(member.offset + 1) · \(member.element.lastPathComponent)") {
                                     currentURL = member.element
+                                    detectedFormat = nil
                                     analyze(url: member.element)
                                 }
                             }
@@ -896,8 +939,7 @@ struct ContentView: View {
                             if ["CUE", "CCD", "TOC", "GDI"].contains(report.format) {
                                 Button("Grant Track Folder Access…") { grantTrackFolder(for: report.file) }
                             }
-                            if !["CHD", "TOC", "NRG", "GDI", "ECM"].contains(report.format),
-                               report.tracks.contains(where: { $0.frames != nil }) {
+                            if report.tracks.contains(where: { $0.storedByteCount != nil }) {
                                 Button(verifying ? "Hashing…" : "Calculate Track SHA-1") { verifyTracks(report) }
                                     .disabled(verifying)
                             }

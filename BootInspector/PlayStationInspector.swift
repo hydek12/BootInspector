@@ -13,9 +13,12 @@ nonisolated struct PlayStationTrack: Identifiable, Sendable {
     var frames: Int?
 
     var completeSectors = true
+    var chdFrames: Range<Int>?
 
     var storedByteCount: Int? {
-        guard completeSectors, index01 != nil, let frames, let sectorBytes else { return nil }
+        guard completeSectors, let sectorBytes else { return nil }
+        if let chdFrames { return chdFrames.count * sectorBytes }
+        guard index01 != nil, let frames else { return nil }
         return (frames + storedPregap) * sectorBytes
     }
 
@@ -39,6 +42,7 @@ nonisolated struct PlayStationReport: Sendable {
     var embeddedSubchannel = false
     var hasSUB = false
     var members: [URL] = []
+    var chdStorage: PlayStationInspector.CHDStorage?
 
     var canUseCHDTool: Bool {
         ["CHD", "TOC", "NRG", "GDI"].contains(format) && !bootValid
@@ -76,6 +80,16 @@ nonisolated enum PlayStationInspector {
         "MODE2/2336": 2336, "MODE2/2352": 2352, "MODE2/2448": 2448, "MODE1/2448": 2448, "CDI/2336": 2336, "CDI/2352": 2352
     ]
 
+    struct CHDStorage: Sendable {
+        let library: URL
+        let logicalBytes: UInt64
+        let hunkBytes: Int
+
+        func open(_ image: URL) throws -> PlayStationCHD {
+            try PlayStationCHD(image, libraryURL: library, logicalBytes: logicalBytes, hunkBytes: hunkBytes)
+        }
+    }
+
     struct Companions {
         var sbi: URL?
         var sub: URL?
@@ -87,10 +101,11 @@ nonisolated enum PlayStationInspector {
     }
 
     static func inspect(_ url: URL, chdLibrary: URL? = Bundle.main.privateFrameworksURL?
-        .appendingPathComponent("libchdr.dylib"), companions: Companions? = nil) throws -> PlayStationReport {
+        .appendingPathComponent("libchdr.dylib"), companions: Companions? = nil,
+                        detectedFormat: String? = nil) throws -> PlayStationReport {
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-        let kind = url.pathExtension.lowercased()
+        let kind = detectedFormat ?? url.pathExtension.lowercased()
         var report = PlayStationReport(file: url, format: kind.uppercased())
         let sidecars = companions ?? Companions(sbi: companion(url, extension: "sbi"), sub: companion(url, extension: "sub"))
         report.sbi = PlayStationSBI.inspect(sidecars.sbi)
@@ -484,6 +499,7 @@ nonisolated enum PlayStationInspector {
         var start = 0
         var storedFrame = 0
         var dataStarts: [Int: Int] = [:]
+        var hashRanges: [Int: Range<Int>] = [:]
         while offset != 0 {
             guard length >= 16, offset <= length - 16, visited.count < 256, visited.insert(offset).inserted else {
                 throw InspectionError("Invalid CHD metadata chain.")
@@ -513,6 +529,10 @@ nonisolated enum PlayStationInspector {
                 report.tracks.append(PlayStationTrack(id: number, type: mode, file: url, sectorBytes: sectorSizes[mode],
                     pregap: gap, start: start + gap, frames: frames - (stored ? gap : 0)))
                 dataStarts[number] = storedFrame + (stored ? gap : 0)
+                // A mixed-mode stored pregap needs a separate extraction layout.
+                if !stored || gap == 0 || fields["PGTYPE"] == "V" + type {
+                    hashRanges[number] = storedFrame..<(storedFrame + frames)
+                }
                 storedFrame += (frames + 3) / 4 * 4
                 start += frames + (stored ? 0 : gap) + postgap
             }
@@ -531,8 +551,15 @@ nonisolated enum PlayStationInspector {
             guard bigEndian(header, 60, 4) == UInt64(PlayStationCHD.frameSize) else {
                 throw InspectionError("This CHD does not use standard CD frames.")
             }
-            let reader = try PlayStationCHD(url, libraryURL: library, logicalBytes: bigEndian(header, 32, 8),
-                                            hunkBytes: Int(bigEndian(header, 56, 4)))
+            let storage = CHDStorage(library: library, logicalBytes: bigEndian(header, 32, 8),
+                                     hunkBytes: Int(bigEndian(header, 56, 4)))
+            let reader = try storage.open(url)
+            let units = storage.logicalBytes / UInt64(PlayStationCHD.frameSize)
+            guard UInt64(storedFrame) <= units else { throw InspectionError("CHD track storage is truncated.") }
+            report.chdStorage = storage
+            for index in report.tracks.indices where report.tracks[index].sectorBytes != nil {
+                report.tracks[index].chdFrames = hashRanges[report.tracks[index].id]
+            }
             for track in report.tracks where track.type.hasPrefix("MODE") && track.sectorBytes != nil {
                 guard let first = dataStarts[track.id], let frames = track.frames else { continue }
                 let readSector = { (block: Int) throws -> Data in
@@ -619,6 +646,25 @@ nonisolated enum PlayStationInspector {
             let detail = String(decoding: try log.read(upToCount: 1024) ?? Data(), as: UTF8.self)
             throw InspectionError("chdman could not read this disc. \(detail)")
         }
+    }
+
+    static func trackHashes(_ report: PlayStationReport) throws -> [Int: String] {
+        let scope = report.file.startAccessingSecurityScopedResource()
+        defer { if scope { report.file.stopAccessingSecurityScopedResource() } }
+        var hashes: [Int: String] = [:]
+        if let storage = report.chdStorage {
+            let reader = try storage.open(report.file)
+            for track in report.tracks {
+                guard let range = track.chdFrames, let bytes = track.sectorBytes else { continue }
+                hashes[track.id] = try reader.sha1(firstFrame: range.lowerBound, frames: range.count,
+                                                 sectorBytes: bytes, audio: track.type == "AUDIO")
+            }
+        } else {
+            for track in report.tracks where track.storedByteCount != nil {
+                hashes[track.id] = try sha1(track)
+            }
+        }
+        return hashes
     }
 
     static func sha1(_ track: PlayStationTrack) throws -> String {

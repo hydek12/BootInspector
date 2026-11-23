@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import Testing
 @testable import BootInspector
@@ -129,6 +130,10 @@ struct PlayStationInspectorTests {
         #expect(report.serial == "SLES-12345")
         #expect(report.volume == "BOOTINSPECTOR TEST")
         #expect(!report.canUseCHDTool)
+        let raw = DiscFixture.raw(DiscFixture.playStationISO())
+        let expected = Insecure.SHA1.hash(data: raw).map { String(format: "%02x", $0) }.joined()
+        #expect(report.tracks.first?.storedByteCount == raw.count)
+        #expect(try PlayStationInspector.trackHashes(report) == [1: expected])
     }
 }
 
