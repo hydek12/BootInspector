@@ -2,6 +2,10 @@
 A drag-and-drop macOS utility that reads raw .iso, .img, and .toast headers to check whether an image contains a valid Apple Partition Map (APM) and a blessed tbxi System Folder before you mount it in UTM or QEMU.
 
 
+## Build
+
+Open `BootInspector.xcodeproj` in Xcode 27.2 and build the BootInspector scheme. The project includes the app, unit test, and UI test targets.
+
 ## PlayStation disc inspection
 
 Use **PlayStation** mode for raw images or cooked ISO. The app detects raw sector layouts by content, including 2,352-byte sectors and 2,448-byte sectors with subchannel data. Opening a CUE, CHD, CCD, ECM, or playlist selects PlayStation mode automatically.
