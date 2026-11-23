@@ -233,15 +233,19 @@ struct DiskImageInspector {
 struct ContentView: View {
     @State private var report: ImageReport?
     @State private var errorMessage: String?
+    @State private var playStationMode = false
+    @State private var psReport: PlayStationReport?
+    @State private var currentURL: URL?
+    @State private var trackFolder: URL?
+    @State private var inspection: Task<Void, Never>?
+    @State private var hashes: [Int: String] = [:]
+    @State private var verifying = false
+    @State private var inspecting = false
     @State private var isTargeted = false
 
-    private let supportedTypes: [UTType] = [
-        .diskImage,
-        UTType(filenameExtension: "iso") ?? .data,
-        UTType(filenameExtension: "toast") ?? .data,
-        UTType(filenameExtension: "img") ?? .data,
-        UTType(filenameExtension: "cdr") ?? .data,
-        UTType(filenameExtension: "bin") ?? .data
+    private let playStationExtensions: Set<String> = [
+        "cue", "chd", "ccd", "m3u", "m3u8", "mds", "mdf", "toc", "nrg",
+        "gdi", "pbp", "ecm", "cso", "zso", "isz", "dax", "raw", "2352", "2448"
     ]
 
     var body: some View {
@@ -249,9 +253,9 @@ struct ContentView: View {
             // Header & File Picker Bar
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("HFS / ISO Partition & Blessing Inspector")
+                    Text(playStationMode ? "PlayStation Disc Inspector" : "HFS / ISO Partition & Blessing Inspector")
                         .font(.headline)
-                    Text("Inspect raw .iso, .toast, .img, or .cdr files for QEMU / UTM PowerPC bootability")
+                    Text(playStationMode ? "Inspect boot identity, firmware guidance, and CD tracks" : "Inspect raw .iso, .toast, .img, or .cdr files for QEMU / UTM PowerPC bootability")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
@@ -262,8 +266,21 @@ struct ContentView: View {
                 .keyboardShortcut("o", modifiers: .command)
             }
 
-            // Drop Zone or Report View
-            if let report = report {
+            Picker("Disc type", selection: $playStationMode) {
+                Text("Mac OS").tag(false)
+                Text("PlayStation").tag(true)
+            }
+            .pickerStyle(.segmented)
+            .onChange(of: playStationMode) {
+                if let currentURL { analyze(url: currentURL) }
+            }
+
+            if inspecting {
+                ProgressView("Reading disc image…")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if playStationMode, let psReport {
+                playStationReportView(psReport)
+            } else if !playStationMode, let report {
                 reportView(report)
             } else {
                 dropZoneView
@@ -287,10 +304,10 @@ struct ContentView: View {
             Image(systemName: "opticaldisc")
                 .font(.system(size: 44))
                 .foregroundColor(isTargeted ? .accentColor : .secondary)
-            Text("Drop a Mac OS .iso, .toast, or .img file here")
+            Text(playStationMode ? "Drop a PlayStation disc image here" : "Drop a Mac OS .iso, .toast, or .img file here")
                 .font(.title3)
                 .fontWeight(.medium)
-            Text("Checks Block 0 DDM, Apple Partition Map (APM), ISO-9660 descriptors, and HFS/HFS+ System Folder blessing")
+            Text(playStationMode ? "Open CUE/BIN, raw images, ISO, CHD, CloneCD, or a disc playlist." : "Checks Block 0 DDM, Apple Partition Map (APM), ISO-9660 descriptors, and HFS/HFS+ System Folder blessing")
                 .font(.caption)
                 .foregroundColor(.secondary)
                 .multilineTextAlignment(.center)
@@ -424,9 +441,9 @@ struct ContentView: View {
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false
-        panel.allowedContentTypes = supportedTypes
+        panel.allowedContentTypes = [.item]
         if panel.runModal() == .OK, let url = panel.url {
-            analyze(url: url)
+            open(url: url)
         }
     }
 
@@ -435,18 +452,222 @@ struct ContentView: View {
         _ = provider.loadObject(ofClass: URL.self) { url, _ in
             guard let url else { return }
             DispatchQueue.main.async {
-                analyze(url: url)
+                open(url: url)
             }
         }
         return true
     }
 
-    private func analyze(url: URL) {
-        errorMessage = nil
-        do {
-            report = try DiskImageInspector.inspect(url: url)
-        } catch {
-            errorMessage = "Failed to inspect image: \(error.localizedDescription)"
+    private func open(url: URL) {
+        currentURL = url
+        trackFolder = nil
+        if playStationExtensions.contains(url.pathExtension.lowercased()), !playStationMode {
+            playStationMode = true
+        } else {
+            analyze(url: url)
         }
+    }
+
+    private func analyze(url: URL) {
+        inspection?.cancel()
+        errorMessage = nil
+        psReport = nil
+        report = nil
+        hashes = [:]
+        verifying = false
+        if playStationMode {
+            inspecting = true
+            let folder = trackFolder
+            inspection = Task {
+                do {
+                    let result = try await Task.detached(priority: .userInitiated) {
+                        let scoped = folder?.startAccessingSecurityScopedResource() ?? false
+                        defer { if scoped { folder?.stopAccessingSecurityScopedResource() } }
+                        return try PlayStationInspector.inspect(url)
+                    }.value
+                    guard !Task.isCancelled else { return }
+                    psReport = result
+                } catch {
+                    guard !Task.isCancelled else { return }
+                    errorMessage = error.localizedDescription
+                }
+                inspecting = false
+            }
+        } else {
+            inspecting = false
+            do {
+                report = try DiskImageInspector.inspect(url: url)
+            } catch {
+                errorMessage = "Failed to inspect image: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func grantTrackFolder(for url: URL) {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.directoryURL = url.deletingLastPathComponent()
+        panel.prompt = "Grant Access"
+        if panel.runModal() == .OK {
+            trackFolder = panel.url
+            analyze(url: url)
+        }
+    }
+
+    private func verifyTracks(_ report: PlayStationReport) {
+        let folder = trackFolder
+        verifying = true
+        errorMessage = nil
+        inspection = Task {
+            let worker = Task.detached(priority: .utility) {
+                let scoped = folder?.startAccessingSecurityScopedResource() ?? false
+                let imageScope = report.file.startAccessingSecurityScopedResource()
+                defer {
+                    if scoped { folder?.stopAccessingSecurityScopedResource() }
+                    if imageScope { report.file.stopAccessingSecurityScopedResource() }
+                }
+                var result: [Int: String] = [:]
+                for track in report.tracks where track.frames != nil {
+                    result[track.id] = try PlayStationInspector.sha1(track)
+                }
+                return result
+            }
+            do {
+                let result = try await withTaskCancellationHandler {
+                    try await worker.value
+                } onCancel: { worker.cancel() }
+                guard !Task.isCancelled else { return }
+                hashes = result
+            } catch {
+                guard !Task.isCancelled else { return }
+                errorMessage = "Could not hash tracks: \(error.localizedDescription)"
+            }
+            verifying = false
+        }
+    }
+
+    private func inspectUsingCHDTool(_ report: PlayStationReport) {
+        let panel = NSOpenPanel()
+        panel.prompt = "Use chdman"
+        panel.message = "Choose the chdman executable from your MAME tools installation."
+        guard panel.runModal() == .OK, let tool = panel.url else { return }
+        let folder = trackFolder
+        inspecting = true
+        errorMessage = nil
+        inspection = Task {
+            do {
+                let result = try await Task.detached(priority: .utility) {
+                    let scoped = folder?.startAccessingSecurityScopedResource() ?? false
+                    defer { if scoped { folder?.stopAccessingSecurityScopedResource() } }
+                    return try PlayStationInspector.inspectUsingCHDTool(report.file, tool: tool)
+                }.value
+                guard !Task.isCancelled else { return }
+                psReport = result
+            } catch {
+                guard !Task.isCancelled else { return }
+                errorMessage = "Could not inspect the CHD boot data: \(error.localizedDescription)"
+            }
+            inspecting = false
+        }
+    }
+
+    private func playStationReportView(_ report: PlayStationReport) -> some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                Label(report.bootValid ? "PlayStation boot entry verified" :
+                        (report.members.isEmpty ? "Boot entry unverified" : "Disc playlist"),
+                      systemImage: report.bootValid ? "checkmark.seal.fill" : "exclamationmark.triangle")
+                    .font(.headline)
+                    .foregroundStyle(report.bootValid ? .green : .orange)
+                GroupBox("Disc identity") {
+                    VStack(spacing: 7) {
+                        infoRow("Image", report.file.lastPathComponent)
+                        infoRow("Format", report.format)
+                        infoRow("Size", ByteCountFormatter.string(fromByteCount: Int64(report.size), countStyle: .file))
+                        infoRow("Serial", report.serial ?? "Unknown")
+                        infoRow("Region", report.region)
+                        ForEach(report.regions.keys.sorted(), id: \.self) { key in
+                            infoRow(key, report.regions[key] ?? "")
+                        }
+                        infoRow("Region-matched BIOS", report.bios)
+                        infoRow("ISO 9660 volume", report.volume ?? "Unavailable")
+                        infoRow("Boot path", report.bootPath ?? "Unavailable")
+                        infoRow("SBI companion", report.hasSBI ? "Present" : "Not found or inaccessible")
+                        if report.hasSUB { infoRow("SUB companion", "Present") }
+                        if let details = report.bootDetails { infoRow("PS-X EXE", details) }
+                    }
+                    .textSelection(.enabled)
+                    .padding(6)
+                }
+                if !report.members.isEmpty {
+                    GroupBox("Playlist discs") {
+                        VStack(alignment: .leading) {
+                            ForEach(Array(report.members.enumerated()), id: \.offset) { member in
+                                Button("Disc \(member.offset + 1) · \(member.element.lastPathComponent)") {
+                                    currentURL = member.element
+                                    analyze(url: member.element)
+                                }
+                            }
+                            Button("Grant Playlist Folder Access…") { grantTrackFolder(for: report.file) }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(6)
+                    }
+                }
+                if report.members.isEmpty {
+                    GroupBox("Tracks") {
+                        VStack(alignment: .leading, spacing: 9) {
+                            ForEach(report.tracks) { track in
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text("Track \(track.id) · \(track.type)").font(.headline)
+                                    Text(track.file.lastPathComponent)
+                                    Text(trackSummary(track))
+                                    if let hash = hashes[track.id] { Text("SHA-1 \(hash)").monospaced() }
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            if report.canUseCHDTool {
+                                Button("Inspect With chdman…") { inspectUsingCHDTool(report) }
+                            }
+                            if ["CUE", "CCD", "TOC", "GDI"].contains(report.format) {
+                                Button("Grant Track Folder Access…") { grantTrackFolder(for: report.file) }
+                            }
+                            if !["CHD", "TOC", "NRG", "GDI"].contains(report.format),
+                               report.tracks.contains(where: { $0.frames != nil }) {
+                                Button(verifying ? "Hashing…" : "Calculate Track SHA-1") { verifyTracks(report) }
+                                    .disabled(verifying)
+                            }
+                        }
+                        .font(.caption)
+                        .textSelection(.enabled)
+                        .padding(6)
+                    }
+                }
+                if !report.warnings.isEmpty {
+                    GroupBox("Inspection notes") {
+                        VStack(alignment: .leading, spacing: 6) {
+                            ForEach(Array(report.warnings.enumerated()), id: \.offset) { entry in
+                                Text(entry.element).frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        }
+                        .font(.caption)
+                        .padding(6)
+                    }
+                }
+                if let config = report.config {
+                    DisclosureGroup("SYSTEM.CNF") {
+                        Text(config).monospaced().textSelection(.enabled)
+                    }
+                }
+            }
+        }
+    }
+
+    private func trackSummary(_ track: PlayStationTrack) -> String {
+        let size = track.sectorBytes.map { "\($0) bytes/sector" } ?? "Sector size unknown"
+        let start = track.start.map { "Start \($0)" } ?? "Start unknown"
+        let length = track.frames.map { "Length \($0) sectors (\($0 / 75)s)" } ?? "Length unknown"
+        return "\(size) · \(start) · \(length) · Pregap \(track.pregap + track.storedPregap) sectors"
     }
 }
