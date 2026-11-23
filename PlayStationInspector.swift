@@ -68,7 +68,8 @@ nonisolated enum PlayStationInspector {
         "MODE2/2336": 2336, "MODE2/2352": 2352, "MODE2/2448": 2448, "MODE1/2448": 2448, "CDI/2336": 2336, "CDI/2352": 2352
     ]
 
-    static func inspect(_ url: URL) throws -> PlayStationReport {
+    static func inspect(_ url: URL, chdLibrary: URL? = Bundle.main.privateFrameworksURL?
+        .appendingPathComponent("libchdr.dylib")) throws -> PlayStationReport {
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
         let kind = url.pathExtension.lowercased()
@@ -77,7 +78,7 @@ nonisolated enum PlayStationInspector {
         report.hasSUB = companion(url, extension: "sub") != nil
         switch kind {
         case "chd":
-            try inspectCHD(url, report: &report)
+            try inspectCHD(url, library: chdLibrary, report: &report)
             return report
         case "m3u", "m3u8":
             report.members = try readPlaylist(url)
@@ -119,7 +120,9 @@ nonisolated enum PlayStationInspector {
             let handle = try FileHandle(forReadingFrom: track.file)
             defer { try? handle.close() }
             guard let descriptor = try volumeDescriptor(handle, track: track, fileSize: handle.seekToEnd()) else { continue }
-            try inspectFilesystem(handle, track: track, descriptor: descriptor, report: &report)
+            try inspectFilesystem(track: track, descriptor: descriptor, report: &report) {
+                try sector(handle, track: track, block: $0)
+            }
             if report.bootPath != nil { break }
         }
         if report.volume == nil { report.warnings.append("No readable ISO 9660 data track was found.") }
@@ -313,8 +316,13 @@ nonisolated enum PlayStationInspector {
 
     private static func volumeDescriptor(_ handle: FileHandle, track: PlayStationTrack, fileSize: UInt64) throws -> Data? {
         let frames = track.frames ?? Int(fileSize / UInt64(track.sectorBytes ?? 2048))
+        return try volumeDescriptor(frames: frames) { try sector(handle, track: track, block: $0) }
+    }
+
+    private static func volumeDescriptor(frames: Int, readSector: (Int) throws -> Data) throws -> Data? {
+        guard frames > 16 else { return nil }
         for block in 16..<min(frames, 64) {
-            let data = try sector(handle, track: track, block: block)
+            let data = try readSector(block)
             guard data.count == 2048, String(decoding: data[1..<6], as: UTF8.self) == "CD001" else { break }
             if data[0] == 1 { return data }
             if data[0] == 255 { break }
@@ -322,20 +330,23 @@ nonisolated enum PlayStationInspector {
         return nil
     }
 
-    private static func sector(_ handle: FileHandle, track: PlayStationTrack, block: Int) throws -> Data {
-        let offset = switch track.type {
+    private static func payloadOffset(_ type: String) -> Int {
+        switch type {
         case "MODE1/2352", "MODE1/2448": 16
         case "MODE2/2352", "MODE2/2448": 24
         case "MODE2/2336": 8
         default: 0
         }
-        let seek = ((track.index01 ?? 0) + block) * (track.sectorBytes ?? 2048) + offset
+    }
+
+    private static func sector(_ handle: FileHandle, track: PlayStationTrack, block: Int) throws -> Data {
+        let seek = ((track.index01 ?? 0) + block) * (track.sectorBytes ?? 2048) + payloadOffset(track.type)
         try handle.seek(toOffset: UInt64(seek))
         return try handle.read(upToCount: 2048) ?? Data()
     }
 
-    private static func inspectFilesystem(_ handle: FileHandle, track: PlayStationTrack, descriptor: Data,
-                                          report: inout PlayStationReport) throws {
+    private static func inspectFilesystem(track: PlayStationTrack, descriptor: Data,
+                                          report: inout PlayStationReport, readSector: (Int) throws -> Data) throws {
         report.volume = String(decoding: descriptor[40..<72], as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
         guard let root = extent(descriptor, at: 156), let maxFrames = track.frames else { return }
         func read(_ entry: Extent, limit: Int) throws -> Data {
@@ -343,7 +354,7 @@ nonisolated enum PlayStationInspector {
             let blocks = (count + 2047) / 2048
             guard entry.block < maxFrames, blocks <= maxFrames - entry.block else { return Data() }
             var bytes = Data()
-            for block in 0..<blocks { bytes.append(try sector(handle, track: track, block: entry.block + block)) }
+            for block in 0..<blocks { bytes.append(try readSector(entry.block + block)) }
             return Data(bytes.prefix(count))
         }
         func find(_ path: [String]) throws -> Extent? {
@@ -382,7 +393,7 @@ nonisolated enum PlayStationInspector {
         } else if try find(["PSX.EXE"]) != nil { report.bootPath = "PSX.EXE" }
 
         var license = Data()
-        for block in 0..<min(maxFrames, 16) { license.append(try sector(handle, track: track, block: block)) }
+        for block in 0..<min(maxFrames, 16) { license.append(try readSector(block)) }
         let text = String(decoding: license, as: UTF8.self).uppercased()
         for (marker, region) in [
             ("SONY COMPUTER ENTERTAINMENT EUROPE", "Europe / PAL"),
@@ -432,7 +443,7 @@ nonisolated enum PlayStationInspector {
         data[start..<(start + count)].reduce(0) { ($0 << 8) | UInt64($1) }
     }
 
-    private static func inspectCHD(_ url: URL, report: inout PlayStationReport) throws {
+    private static func inspectCHD(_ url: URL, library: URL?, report: inout PlayStationReport) throws {
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
         let length = try handle.seekToEnd()
@@ -446,6 +457,8 @@ nonisolated enum PlayStationInspector {
         var offset = bigEndian(header, 48, 8)
         var visited = Set<UInt64>()
         var start = 0
+        var storedFrame = 0
+        var dataStarts: [Int: Int] = [:]
         while offset != 0 {
             guard length >= 16, offset <= length - 16, visited.count < 256, visited.insert(offset).inserted else {
                 throw InspectionError("Invalid CHD metadata chain.")
@@ -473,12 +486,42 @@ nonisolated enum PlayStationInspector {
                 let mode = ["MODE2_RAW":"MODE2/2352", "MODE1_RAW":"MODE1/2352", "MODE1":"MODE1/2048", "MODE2":"MODE2/2336"][type] ?? type
                 report.tracks.append(PlayStationTrack(id: number, type: mode, file: url, sectorBytes: sectorSizes[mode],
                     pregap: gap, start: start + gap, frames: frames - (stored ? gap : 0)))
+                dataStarts[number] = storedFrame + (stored ? gap : 0)
+                storedFrame += (frames + 3) / 4 * 4
                 start += frames + (stored ? 0 : gap) + postgap
             }
             offset = bigEndian(record, 8, 8)
         }
-        report.warnings.append("CHD track metadata only. Use chdman or open the equivalent CUE/BIN to inspect the boot executable and region.")
-        if report.tracks.isEmpty { report.warnings.append("This CHD has no supported CD track records.") }
+        guard !report.tracks.isEmpty else {
+            report.warnings.append("This CHD has no supported CD track records.")
+            return
+        }
+        let fallback = "CHD track metadata only. Use chdman or open the equivalent CUE/BIN to inspect the boot executable and region."
+        guard let library, FileManager.default.fileExists(atPath: library.path) else {
+            report.warnings.append(fallback)
+            return
+        }
+        do {
+            guard bigEndian(header, 60, 4) == UInt64(PlayStationCHD.frameSize) else {
+                throw InspectionError("This CHD does not use standard CD frames.")
+            }
+            let reader = try PlayStationCHD(url, libraryURL: library, logicalBytes: bigEndian(header, 32, 8),
+                                            hunkBytes: Int(bigEndian(header, 56, 4)))
+            for track in report.tracks where track.type.hasPrefix("MODE") && track.sectorBytes != nil {
+                guard let first = dataStarts[track.id], let frames = track.frames else { continue }
+                let readSector = { (block: Int) throws -> Data in
+                    try reader.sector(frame: first + block, payloadOffset: payloadOffset(track.type))
+                }
+                guard let descriptor = try volumeDescriptor(frames: frames, readSector: readSector) else { continue }
+                try inspectFilesystem(track: track, descriptor: descriptor, report: &report, readSector: readSector)
+                if report.bootPath != nil { break }
+            }
+            if report.bootPath == nil { report.warnings.append("No PlayStation boot entry was found in the decoded CHD tracks.") }
+            if report.region == "Conflicting evidence" { report.warnings.append("The boot serial and license area indicate different regions.") }
+        } catch {
+            report.warnings.append("Native CHD read failed. \(error.localizedDescription)")
+            report.warnings.append(fallback)
+        }
     }
 
     static func inspectUsingCHDTool(_ url: URL, tool: URL) throws -> PlayStationReport {
@@ -488,7 +531,7 @@ nonisolated enum PlayStationInspector {
             if imageScope { url.stopAccessingSecurityScopedResource() }
             if toolScope { tool.stopAccessingSecurityScopedResource() }
         }
-        var container = try inspect(url)
+        var container = try inspect(url, chdLibrary: nil)
         guard container.canUseCHDTool, tool.lastPathComponent == "chdman",
               FileManager.default.isExecutableFile(atPath: tool.path) else {
             throw InspectionError("Select an executable chdman for a supported CD image.")
