@@ -42,3 +42,7 @@ The SBI check reads the same-name companion and validates the header, BCD timest
 [DuckStation GameDB](https://github.com/stenzek/duckstation/blob/master/src/core/game_database.cpp) · [Redump LibCrypt notes](https://wiki.redump.info/LibCrypt)
 
 [SBI record format](https://psx-spx.consoledev.net/dev/ps1/cdr/cdromfileformats/diskimages/)
+
+### Run the tests
+
+Run the BootInspector scheme’s Test action in Xcode, or use `xcodebuild -project BootInspector.xcodeproj -scheme BootInspector -destination 'platform=macOS' test`. The app-hosted unit tests generate their own disc fixtures. The native CHD case runs when the app contains bundled libchdr or `BOOTINSPECTOR_TEST_LIBCHDR` points to a compatible dylib in the test process environment.

@@ -6,12 +6,12 @@ import UniformTypeIdentifiers
 
 extension Data {
     func readUInt16BE(at offset: Int) -> UInt16? {
-        guard offset >= 0, offset + 2 <= count else { return nil }
+        guard offset >= 0, offset <= count - 2 else { return nil }
         return (UInt16(self[offset]) << 8) | UInt16(self[offset + 1])
     }
 
     func readUInt32BE(at offset: Int) -> UInt32? {
-        guard offset >= 0, offset + 4 <= count else { return nil }
+        guard offset >= 0, offset <= count - 4 else { return nil }
         return (UInt32(self[offset]) << 24) |
                (UInt32(self[offset + 1]) << 16) |
                (UInt32(self[offset + 2]) << 8) |
@@ -19,7 +19,7 @@ extension Data {
     }
 
     func readASCII(at offset: Int, length: Int) -> String {
-        guard offset >= 0, offset + length <= count else { return "" }
+        guard offset >= 0, length >= 0, offset <= count, length <= count - offset else { return "" }
         let slice = self[offset..<(offset + length)]
         let trimmed = slice.prefix { $0 != 0 }
         return String(bytes: trimmed, encoding: .ascii)?
@@ -99,7 +99,8 @@ struct DiskImageInspector {
             let totalEntries = Int(headerData.readUInt32BE(at: apmStride + 4) ?? 1)
             let safeMax = min(totalEntries, 64)
 
-            for idx in 1...safeMax {
+            for entry in 0..<safeMax {
+                let idx = entry + 1
                 let entryOffset = idx * apmStride
                 guard entryOffset + 136 <= headerData.count else { break }
                 guard headerData.readUInt16BE(at: entryOffset) == 0x504D else { break }

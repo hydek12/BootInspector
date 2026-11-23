@@ -31,6 +31,36 @@ struct PlayStationCatalogTests {
         #expect(batch.first?.sbi == report.sbi.summary)
     }
 
+    @Test func classifiesCatalogAliasesAndProtectionIndependentlyOfBootValidity() throws {
+        let fixture = try DiscFixture()
+        defer { fixture.remove() }
+        let yaml = """
+        SLES-12345:
+          name: "Protected Test"
+          libcrypt: true
+          codes:
+            - SLES-54321
+        SLUS-00001:
+          name: "Other Test"
+        """
+        let catalog = try PlayStationCatalog(url: fixture.write("gamedb.yaml", yaml))
+        var report = PlayStationReport(file: fixture.folder.appendingPathComponent("disc.cue"), format: "CUE")
+        report.serial = "SLES-54321"
+        let missing = PlayStationTools.assess(report, gameDB: catalog, dat: nil)
+        #expect(missing.title == "Protected Test")
+        #expect(missing.match == "Serial match")
+        #expect(missing.libCrypt.contains("SBI missing"))
+        report.embeddedSubchannel = true
+        #expect(PlayStationTools.assess(report, gameDB: catalog, dat: nil).libCrypt.contains("contents unverified"))
+        report.sbi = .valid(3)
+        #expect(PlayStationTools.assess(report, gameDB: catalog, dat: nil).libCrypt.contains("structure valid"))
+        report.sbi = .invalid("bad header")
+        #expect(PlayStationTools.assess(report, gameDB: catalog, dat: nil).libCrypt.contains("unusable"))
+        report.serial = "SLUS-00001"
+        #expect(PlayStationTools.assess(report, gameDB: catalog, dat: nil).libCrypt.contains("no LibCrypt flag"))
+        #expect(PlayStationTools.assess(report, gameDB: nil, dat: nil).libCrypt.hasPrefix("Unknown"))
+    }
+
     @Test func exactMatchRequiresOrderedCompleteTrackSet() throws {
         let file = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).appendingPathExtension("xml")
         defer { try? FileManager.default.removeItem(at: file) }
