@@ -78,4 +78,56 @@ struct BootInspectorTests {
         #expect(!empty.hasISO9660)
         #expect(!empty.isBootablePPC)
     }
+    @Test func distinguishesMissingStaleAndIncompleteBootMetadata() throws {
+        let fixture = try DiscFixture()
+        defer { fixture.remove() }
+        let candidate = MacBootCatalog.Folder(id: 42, name: "System Folder")
+        let cases: [(Data, MacBootCatalog.Finding)] = [
+            (DiscFixture.macImage(blessedID: 0), .missingBlessing([candidate])),
+            (DiscFixture.macImage(blessedID: 99, systemFolderID: 42), .staleBlessing([candidate])),
+            (DiscFixture.macImage(bootFile: false), .noSupportedSystemFolder)
+        ]
+        for (index, sample) in cases.enumerated() {
+            let report = try DiskImageInspector.inspect(url: fixture.write("case-\(index).img", sample.0))
+            #expect(report.partitions.first?.bootFinding == sample.1)
+            #expect(!report.isBootablePPC)
+        }
+    }
+
+    @Test func leavesHeaderOnlyAndCyclicCatalogsUnverified() throws {
+        let fixture = try DiscFixture()
+        defer { fixture.remove() }
+        for (index, bytes) in [DiscFixture.macImage(catalog: false), DiscFixture.macImage(cyclic: true)].enumerated() {
+            let report = try DiskImageInspector.inspect(url: fixture.write("invalid-\(index).img", bytes))
+            #expect(report.partitions.first?.blessedFolderID == 42)
+            #expect(!report.isBootablePPC)
+            guard case .unavailable = report.partitions.first?.bootFinding else {
+                Issue.record("Expected catalog validation to be unavailable")
+                continue
+            }
+        }
+    }
+
+    @Test func resolvesTheCatalogInsideAnHFSWrapper() throws {
+        let fixture = try DiscFixture()
+        defer { fixture.remove() }
+        var bytes = DiscFixture.macImage(signature: 0x482B, blessedID: 75)
+        let start = 8 * 512
+        let embeddedStart = start + 4 * 512
+        let size = 12 * 512
+        let innerVolume = Data(bytes[start..<(start + size)])
+        bytes.replaceSubrange(embeddedStart..<(embeddedStart + size), with: innerVolume)
+        DiscFixture.put(20, in: &bytes, at: 512 + 12, count: 4)
+        let wrapper = start + 1024
+        bytes.replaceSubrange(wrapper..<(wrapper + 512), with: Data(repeating: 0, count: 512))
+        DiscFixture.put(0x4244, in: &bytes, at: wrapper, count: 2)
+        DiscFixture.put(512, in: &bytes, at: wrapper + 20, count: 4)
+        DiscFixture.put(0x482B, in: &bytes, at: wrapper + 124, count: 2)
+        DiscFixture.put(4, in: &bytes, at: wrapper + 126, count: 2)
+        DiscFixture.put(12, in: &bytes, at: wrapper + 128, count: 2)
+        let report = try DiskImageInspector.inspect(url: fixture.write("wrapped.toast", bytes))
+        #expect(report.partitions.first?.bootFinding == .verified(.init(id: 75, name: "System Folder")))
+        #expect(report.partitions.first?.hfsStatus?.contains("HFS wrapper") == true)
+    }
+
 }

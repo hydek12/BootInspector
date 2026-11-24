@@ -38,8 +38,13 @@ nonisolated struct PartitionRecord: Identifiable {
     let byteOffset: UInt64
     let byteSize: UInt64
     let hfsStatus: String?
-    let isBlessed: Bool
     let blessedFolderID: UInt32?
+    let bootFinding: MacBootCatalog.Finding?
+
+    var hasVerifiedBootFiles: Bool {
+        if case .verified = bootFinding { return true }
+        return false
+    }
 }
 
 nonisolated struct ImageReport {
@@ -117,14 +122,14 @@ nonisolated struct DiskImageInspector {
                 let byteSize = UInt64(pBlockCount) * UInt64(apmStride)
 
                 var hfsStatus: String? = nil
-                var isBlessed = false
                 var blessedID: UInt32? = nil
+                var bootFinding: MacBootCatalog.Finding?
 
                 if pType == "Apple_HFS" || pType == "Apple_HFSX" {
-                    let result = inspectHFSPartition(handle: handle, partitionOffset: byteOffset, fileSize: fileSize)
+                    let result = inspectHFSPartition(handle: handle, partitionOffset: byteOffset, partitionSize: byteSize, fileSize: fileSize)
                     hfsStatus = result.summary
-                    isBlessed = result.isBlessed
                     blessedID = result.blessedDirID
+                    bootFinding = result.finding
                 }
 
                 partitions.append(PartitionRecord(
@@ -136,14 +141,14 @@ nonisolated struct DiskImageInspector {
                     byteOffset: byteOffset,
                     byteSize: byteSize,
                     hfsStatus: hfsStatus,
-                    isBlessed: isBlessed,
-                    blessedFolderID: blessedID
+                    blessedFolderID: blessedID,
+                    bootFinding: bootFinding
                 ))
             }
         }
 
         // 4. Generate Bootability Verdict
-        let blessedPartitions = partitions.filter { $0.isBlessed }
+        let verifiedPartition = partitions.first(where: \.hasVerifiedBootFiles)
         let hfsPartitions = partitions.filter { $0.type == "Apple_HFS" || $0.type == "Apple_HFSX" }
 
         let verdictTitle: String
@@ -151,15 +156,22 @@ nonisolated struct DiskImageInspector {
         let isBootablePPC: Bool
         var suggestedCmd: String? = nil
 
-        if let firstBlessed = blessedPartitions.first {
+        if let partition = verifiedPartition {
             isBootablePPC = true
-            verdictTitle = "BOOTABLE MAC PPC IMAGE"
-            verdictDetail = "Valid Apple Partition Map found with a blessed System Folder (CNID \(firstBlessed.blessedFolderID ?? 0)) on Partition \(firstBlessed.id) (\(firstBlessed.name)). OpenBIOS should locate \\\\:tbxi automatically."
-            suggestedCmd = "boot cd:\(firstBlessed.id),\\\\:tbxi"
+            verdictTitle = "CLASSIC MAC PPC BOOT FILES VERIFIED"
+            verdictDetail = partition.bootFinding?.detail ?? ""
+            suggestedCmd = "boot cd:\(partition.id),\\:tbxi"
         } else if !hfsPartitions.isEmpty {
             isBootablePPC = false
-            verdictTitle = "UNBLESSED HFS VOLUME (LIKELY TO HANG)"
-            verdictDetail = "Found an Apple_HFS partition, but its Master Directory Block reports Blessed Folder ID = 0. OpenBIOS will fail at cdrom:,\\\\:tbxi unless the System Folder is blessed."
+            let finding = hfsPartitions.compactMap(\.bootFinding).first { finding in
+                switch finding {
+                case .missingBlessing, .staleBlessing: true
+                default: false
+                }
+            }
+            verdictTitle = finding == nil ? "CLASSIC MAC PPC BOOT UNVERIFIED" : "SYSTEM FOLDER BLESSING NEEDS ATTENTION"
+            verdictDetail = (finding ?? hfsPartitions.first?.bootFinding)?.detail ??
+                hfsPartitions.first?.hfsStatus ?? "The Mac boot metadata could not be verified."
         } else if hasISO && !hasAPM {
             isBootablePPC = false
             verdictTitle = "PC / ISO-9660 ONLY — NOT BOOTABLE ON PPC"
@@ -187,47 +199,57 @@ nonisolated struct DiskImageInspector {
         )
     }
 
-    private static func inspectHFSPartition(handle: FileHandle, partitionOffset: UInt64, fileSize: UInt64) -> (summary: String, isBlessed: Bool, blessedDirID: UInt32?) {
+    private static func inspectHFSPartition(handle: FileHandle, partitionOffset: UInt64, partitionSize: UInt64, fileSize: UInt64)
+        -> (summary: String, blessedDirID: UInt32?, finding: MacBootCatalog.Finding?) {
         // Volume Header / Master Directory Block sits 1024 bytes into the partition
         let mdbOffset = partitionOffset + 1024
-        guard mdbOffset + 512 <= fileSize else {
-            return ("Partition truncated past EOF", false, nil)
+        guard partitionOffset <= fileSize, partitionSize <= fileSize - partitionOffset,
+              partitionSize >= 1536 else {
+            return ("Partition truncated past EOF", nil, nil)
         }
 
         do {
             try handle.seek(toOffset: mdbOffset)
-            guard let block = try handle.read(upToCount: 512), block.count >= 120 else {
-                return ("Unable to read Volume Header", false, nil)
+            guard var block = try handle.read(upToCount: 512), block.count == 512 else {
+                return ("Unable to read Volume Header", nil, nil)
             }
 
-            let sig = block.readUInt16BE(at: 0) ?? 0
-
-            if sig == 0x4244 {
-                // Classic HFS ("BD"): drFndrInfo[0] (blessed System Folder DirID) is at offset 86 (0x56)
-                let blessedDirID = block.readUInt32BE(at: 86) ?? 0
-                let volNameLen = Int(block[36])
-                let volName = volNameLen > 0 && volNameLen <= 27
-                    ? block.readASCII(at: 37, length: volNameLen)
-                    : "HFS Volume"
-                if blessedDirID > 0 {
-                    return ("HFS Standard (\"\(volName)\") — Blessed System DirID: \(blessedDirID)", true, blessedDirID)
-                } else {
-                    return ("HFS Standard (\"\(volName)\") — NOT Blessed (DirID: 0)", false, 0)
+            var volumeOffset = partitionOffset
+            var volumeSize = partitionSize
+            var signature = block.readUInt16BE(at: 0) ?? 0
+            var wrapped = false
+            if signature == 0x4244, let embedded = block.readUInt16BE(at: 124), [0x482B, 0x4858].contains(embedded) {
+                let allocationSize = UInt64(block.readUInt32BE(at: 20) ?? 0)
+                let allocationStart = UInt64(block.readUInt16BE(at: 28) ?? 0) * 512
+                let start = allocationStart + UInt64(block.readUInt16BE(at: 126) ?? 0) * allocationSize
+                let length = UInt64(block.readUInt16BE(at: 128) ?? 0) * allocationSize
+                guard allocationSize > 0, allocationSize.isMultiple(of: 512),
+                      start <= partitionSize, length >= 1536, length <= partitionSize - start else {
+                    return ("Invalid HFS wrapper extent", nil, nil)
                 }
-            } else if sig == 0x482B || sig == 0x4858 {
-                // HFS+ ("H+") or HFSX ("HX"): finderInfo[0] (blessed System Folder CNID) is at offset 80 (0x50)
-                let formatLabel = (sig == 0x4858) ? "HFSX" : "HFS+"
-                let blessedDirID = block.readUInt32BE(at: 80) ?? 0
-                if blessedDirID > 0 {
-                    return ("\(formatLabel) Extended — Blessed System CNID: \(blessedDirID)", true, blessedDirID)
-                } else {
-                    return ("\(formatLabel) Extended — NOT Blessed (CNID: 0)", false, 0)
+                volumeOffset += start
+                volumeSize = length
+                try handle.seek(toOffset: volumeOffset + 1024)
+                guard let embeddedHeader = try handle.read(upToCount: 512), embeddedHeader.count == 512,
+                      embeddedHeader.readUInt16BE(at: 0) == embedded else {
+                    return ("Missing embedded HFS Plus header", nil, nil)
                 }
-            } else {
-                return (String(format: "Unknown HFS signature (0x%04X)", sig), false, nil)
+                block = embeddedHeader
+                signature = embedded
+                wrapped = true
             }
+            let isClassic = signature == 0x4244
+            guard isClassic || signature == 0x482B || signature == 0x4858 else {
+                return (String(format: "Unknown HFS signature (0x%04X)", signature), nil, nil)
+            }
+            let format = isClassic ? "HFS Standard" : signature == 0x4858 ? "HFSX" : "HFS+"
+            let label = wrapped ? "\(format) in HFS wrapper" : format
+            let blessedID = block.readUInt32BE(at: isClassic ? 92 : 80) ?? 0
+            let finding = MacBootCatalog.inspect(handle: handle, header: block, offset: volumeOffset,
+                                                 length: volumeSize, blessedID: blessedID)
+            return ("\(label) · recorded folder ID \(blessedID)", blessedID, finding)
         } catch {
-            return ("I/O error reading partition header", false, nil)
+            return ("I/O error reading partition header", nil, nil)
         }
     }
 }
@@ -249,6 +271,7 @@ struct ContentView: View {
     @State private var biosMatches: [PlayStationTools.BIOS]?
     @State private var alundraProfile = false
     @State private var cueRepair: PlayStationTools.CueRepair?
+    @State private var macRepair: MacBlessingRepair.Plan?
     @State private var batch: [PlayStationTools.ScanEntry]?
     @State private var selectedDisc: URL?
     @State private var scanTask: Task<Void, Never>?
@@ -431,7 +454,7 @@ struct ContentView: View {
                                             .font(.system(.caption, design: .monospaced))
                                             .padding(.horizontal, 6)
                                             .padding(.vertical, 2)
-                                            .background(part.isBlessed ? Color.green.opacity(0.2) : Color.secondary.opacity(0.15))
+                                            .background(part.hasVerifiedBootFiles ? Color.green.opacity(0.2) : Color.secondary.opacity(0.15))
                                             .cornerRadius(4)
                                     }
 
@@ -441,13 +464,17 @@ struct ContentView: View {
 
                                     if let hfs = part.hfsStatus {
                                         HStack(spacing: 6) {
-                                            Image(systemName: part.isBlessed ? "checkmark.circle.fill" : "xmark.circle.fill")
-                                                .foregroundColor(part.isBlessed ? .green : .red)
+                                            Image(systemName: part.hasVerifiedBootFiles ? "checkmark.circle.fill" : "questionmark.circle")
+                                                .foregroundColor(part.hasVerifiedBootFiles ? .green : .secondary)
                                             Text(hfs)
                                                 .font(.caption)
                                                 .fontWeight(.medium)
                                         }
                                         .padding(.top, 2)
+                                    }
+                                    if let finding = part.bootFinding {
+                                        Text(finding.detail).font(.caption).foregroundStyle(.secondary)
+                                        macRepairControls(for: part.id, finding: finding)
                                     }
                                 }
                                 .padding(8)
@@ -458,6 +485,79 @@ struct ContentView: View {
                         .padding(4)
                     }
                 }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func macRepairControls(for partitionID: Int, finding: MacBootCatalog.Finding) -> some View {
+        if let plan = macRepair, plan.partitionID == partitionID {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Repair preview").font(.subheadline.bold())
+                Text("Set the startup folder to \(plan.folder.name) (CNID \(plan.folder.id)).")
+                Text("Current startup ID \(plan.currentID) · Classic Mac OS ID \(plan.classicID)")
+                Text("Both HFS+ volume headers will be updated in the new image.")
+                HStack {
+                    Button("Cancel") { macRepair = nil }.disabled(toolBusy)
+                    Button("Save Repaired Image…") { saveMacRepair(plan) }.disabled(toolBusy)
+                }
+            }
+            .padding(.vertical, 6)
+        } else {
+            switch finding {
+            case .missingBlessing(let folders), .staleBlessing(let folders):
+                Menu("Preview Blessing Repair") {
+                    ForEach(folders, id: \.id) { folder in
+                        Button("\(folder.name) (CNID \(folder.id))") { previewMacRepair(partitionID, folderID: folder.id) }
+                    }
+                }
+                .disabled(toolBusy)
+            default:
+                EmptyView()
+            }
+        }
+    }
+
+    private func previewMacRepair(_ partitionID: Int, folderID: UInt32) {
+        guard let source = currentURL else { return }
+        let folder = trackFolder
+        toolBusy = true
+        toolError = nil
+        macRepair = nil
+        Task {
+            defer { toolBusy = false }
+            let outcome = await Task.detached(priority: .utility) {
+                let scope = folder?.startAccessingSecurityScopedResource() ?? false
+                defer { if scope { folder?.stopAccessingSecurityScopedResource() } }
+                return try MacBlessingRepair.preview(source, partitionID: partitionID, folderID: folderID)
+            }.result
+            guard currentURL == source, !playStationMode else { return }
+            switch outcome {
+            case .success(let plan): macRepair = plan
+            case .failure(let error): toolError = error.localizedDescription
+            }
+        }
+    }
+
+    private func saveMacRepair(_ plan: MacBlessingRepair.Plan) {
+        guard let source = currentURL else { return }
+        let name = source.deletingPathExtension().lastPathComponent + " (repaired)"
+        let filename = source.pathExtension.isEmpty ? name : name + "." + source.pathExtension
+        guard let target = exportDestination(filename, directory: source.deletingLastPathComponent()) else { return }
+        let folder = trackFolder
+        toolBusy = true
+        toolError = nil
+        Task {
+            defer { toolBusy = false }
+            let outcome = await Task.detached(priority: .utility) {
+                let scope = folder?.startAccessingSecurityScopedResource() ?? false
+                defer { if scope { folder?.stopAccessingSecurityScopedResource() } }
+                try MacBlessingRepair.saveCopy(of: source, to: target, plan: plan)
+            }.result
+            guard currentURL == source, !playStationMode else { return }
+            switch outcome {
+            case .success: open(url: target)
+            case .failure(let error): toolError = error.localizedDescription
             }
         }
     }
@@ -520,6 +620,7 @@ struct ContentView: View {
         psReport = nil
         report = nil
         cueRepair = nil
+        macRepair = nil
         inspecting = true
         errorMessage = nil
         toolError = nil
@@ -569,6 +670,7 @@ struct ContentView: View {
         errorMessage = nil
         toolError = nil
         alundraProfile = false
+        macRepair = nil
         psReport = nil
         report = nil
         hashes = [:]
@@ -594,14 +696,23 @@ struct ContentView: View {
                 inspecting = false
             }
         } else {
-            inspecting = false
-            do {
-                let folder = trackFolder
-                let scoped = folder?.startAccessingSecurityScopedResource() ?? false
-                defer { if scoped { folder?.stopAccessingSecurityScopedResource() } }
-                report = try DiskImageInspector.inspect(url: url)
-            } catch {
-                errorMessage = "Failed to inspect image: \(error.localizedDescription)"
+            inspecting = true
+            let folder = trackFolder
+            inspection = Task {
+                let worker = Task.detached(priority: .userInitiated) {
+                    let scoped = folder?.startAccessingSecurityScopedResource() ?? false
+                    defer { if scoped { folder?.stopAccessingSecurityScopedResource() } }
+                    return try DiskImageInspector.inspect(url: url)
+                }
+                let result = await withTaskCancellationHandler {
+                    await worker.result
+                } onCancel: { worker.cancel() }
+                guard !Task.isCancelled else { return }
+                inspecting = false
+                switch result {
+                case .success(let image): report = image
+                case .failure(let error): errorMessage = error.localizedDescription
+                }
             }
         }
     }

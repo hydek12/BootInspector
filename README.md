@@ -6,6 +6,16 @@ A drag-and-drop macOS utility that reads raw .iso, .img, and .toast headers to c
 
 Open `BootInspector.xcodeproj` in Xcode 27.2 and build the BootInspector scheme. The project includes the app, unit test, and UI test targets.
 
+## Classic Mac boot diagnostics
+
+For Apple Partition Map images, BootInspector inspects classic HFS, HFS+, HFSX, and HFS-wrapped HFS+ catalogs. The classic PowerPC tbxi profile checks whether a recorded blessed folder ID actually identifies a folder with catalog entries for System, Finder, and a tbxi boot file. When the recorded ID is missing or stale, the report lists any folders with those entries.
+
+The check reads catalog metadata. It does not execute the boot files or validate other startup profiles such as Old World boot blocks or early OS X. Catalogs that require extents overflow records are reported as unverified.
+
+For a missing or stale blessing on a clean, non-journaled, unwrapped HFS+ volume, choose **Preview Blessing Repair** on a candidate. BootInspector checks the startup-file fork layouts, resource-fork headers, CHRP marker, and agreement between the primary and alternate HFS+ headers. **Save Repaired Image** updates the blessing and write count in both headers of a separate copy, then reopens the copy to verify its boot metadata. The original image stays in place.
+
+[Apple HFS Plus Volume Format](https://developer.apple.com/library/archive/technotes/tn/tn1150.html)
+
 ## PlayStation disc inspection
 
 Drop an image to select its inspection mode automatically. BootInspector checks signatures and filesystem data to distinguish Mac OS, generic ISO 9660, and PlayStation images, including cooked and raw layouts. Drop several files or a folder to scan the selection recursively and open a disc report directly in the main window. Use the **Disc** selector in the same window to switch between reports.

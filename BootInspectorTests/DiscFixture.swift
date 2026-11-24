@@ -32,22 +32,89 @@ nonisolated struct DiscFixture {
     }
 
     static func macImage(stride: Int = 512, signature: UInt64 = 0x4244, blessedID: UInt64 = 42,
-                         entries: UInt64 = 1, start: UInt64 = 8) -> Data {
-        var image = Data(repeating: 0, count: 24_576)
+                         entries: UInt64 = 1, start: UInt64 = 8, catalog: Bool = true, cyclic: Bool = false,
+                         systemFolderID: UInt64? = nil, bootFile: Bool = true) -> Data {
+        var image = Data(repeating: 0, count: 49_152)
         put(0x4552, in: &image, at: 0, count: 2)
         put(UInt64(stride), in: &image, at: 2, count: 2)
         put(0x504D, in: &image, at: stride, count: 2)
         put(entries, in: &image, at: stride + 4, count: 4)
         put(start, in: &image, at: stride + 8, count: 4)
-        put(4, in: &image, at: stride + 12, count: 4)
+        put(12, in: &image, at: stride + 12, count: 4)
         put("System", in: &image, at: stride + 16)
         put("Apple_HFS", in: &image, at: stride + 48)
         let header = Int(start) * stride + 1024
         if header + 90 <= image.count {
             put(signature, in: &image, at: header, count: 2)
-            put(blessedID, in: &image, at: header + (signature == 0x4244 ? 86 : 80), count: 4)
+            put(blessedID, in: &image, at: header + (signature == 0x4244 ? 92 : 80), count: 4)
+            if catalog, [0x4244, 0x482B, 0x4858].contains(signature) {
+                putCatalog(in: &image, header: header, classic: signature == 0x4244, cyclic: cyclic,
+                           folderID: systemFolderID ?? (blessedID == 0 ? 42 : blessedID), bootFile: bootFile)
+            }
         }
         return image
+    }
+
+    private static func putCatalog(in image: inout Data, header: Int, classic: Bool, cyclic: Bool,
+                                   folderID: UInt64, bootFile: Bool) {
+        let nodeSize = classic ? 512 : 1024
+        let start = header + 512
+        if classic {
+            put(8, in: &image, at: header + 18, count: 2)
+            put(512, in: &image, at: header + 20, count: 4)
+            put(0, in: &image, at: header + 28, count: 2)
+            put(UInt64(2 * nodeSize), in: &image, at: header + 146, count: 4)
+            put(3, in: &image, at: header + 150, count: 2)
+            put(2, in: &image, at: header + 152, count: 2)
+        } else {
+            put(512, in: &image, at: header + 40, count: 4)
+            put(12, in: &image, at: header + 44, count: 4)
+            put(UInt64(2 * nodeSize), in: &image, at: header + 272, count: 8)
+            put(3, in: &image, at: header + 288, count: 4)
+            put(4, in: &image, at: header + 292, count: 4)
+        }
+        func entry(parent: UInt64, name: String, type: String?) -> Data {
+            let encoded = classic ? Data(name.utf8) : Data(name.utf16.flatMap { [UInt8($0 >> 8), UInt8(truncatingIfNeeded: $0)] })
+            let key = (classic ? 7 : 8) + encoded.count
+            let value = (key + 1) / 2 * 2
+            let contentSize = type == nil ? (classic ? 70 : 88) : (classic ? 102 : 248)
+            var record = Data(repeating: 0, count: value + contentSize)
+            put(UInt64(key - (classic ? 1 : 2)), in: &record, at: 0, count: classic ? 1 : 2)
+            put(parent, in: &record, at: 2, count: 4)
+            put(UInt64(name.utf16.count), in: &record, at: 6, count: classic ? 1 : 2)
+            record.replaceSubrange((classic ? 7 : 8)..<key, with: encoded)
+            put(type == nil ? 1 : 2, in: &record, at: value, count: classic ? 1 : 2)
+            if let type {
+                put(type, in: &record, at: value + (classic ? 4 : 48))
+                let fork = type == "zsys" ? (classic ? 36 : 168) : (classic ? 26 : 88)
+                put(512, in: &record, at: value + fork, count: classic ? 4 : 8)
+            } else {
+                put(folderID, in: &record, at: value + (classic ? 6 : 8), count: 4)
+            }
+            return record
+        }
+        var entries = [entry(parent: 2, name: "System Folder", type: nil),
+                       entry(parent: folderID, name: "Finder", type: "FNDR"),
+                       entry(parent: folderID, name: "System", type: "zsys")]
+        if bootFile { entries.append(entry(parent: folderID, name: "Mac OS ROM", type: "tbxi")) }
+        image[start + 8] = 1
+        put(UInt64(entries.count), in: &image, at: start + 20, count: 4)
+        put(1, in: &image, at: start + 24, count: 4)
+        put(1, in: &image, at: start + 28, count: 4)
+        put(UInt64(nodeSize), in: &image, at: start + 32, count: 2)
+        put(2, in: &image, at: start + 36, count: 4)
+        let leaf = start + nodeSize
+        image[leaf + 8] = 0xFF
+        image[leaf + 9] = 1
+        if cyclic { put(1, in: &image, at: leaf, count: 4) }
+        put(UInt64(entries.count), in: &image, at: leaf + 10, count: 2)
+        var cursor = 14
+        for (i, record) in entries.enumerated() {
+            put(UInt64(cursor), in: &image, at: leaf + nodeSize - (i + 1) * 2, count: 2)
+            image.replaceSubrange((leaf + cursor)..<(leaf + cursor + record.count), with: record)
+            cursor += record.count
+        }
+        put(UInt64(cursor), in: &image, at: leaf + nodeSize - (entries.count + 1) * 2, count: 2)
     }
 
     static func playStationISO(bootName: String = "SLES_123.45", license: String = "SONY COMPUTER ENTERTAINMENT EUROPE",
